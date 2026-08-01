@@ -5,7 +5,7 @@
 
 // 1. Deploy the backend-apps-script project as a Web App (Execute as: Me, Who has access: Anyone)
 // 2. Paste that deployment URL (ends in /exec) below, between the quotes.
-const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxxrDgBLHCRGhaGJFQwHBtK8j6WNPai3IVeA06iBH_Hca4tMTQnXEDNB_HoyFN1KRrS7w/exec';
+const SCRIPT_URL = 'PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE';
 
 const state = {
   user: null,
@@ -180,10 +180,10 @@ function badgePct(p) {
   return '<span class="badge ' + cls + '">' + p + '%</span>';
 }
 function renderTable(headers, rows) {
-  return '<table><thead><tr>' + headers.map(function (h) { return '<th>' + esc(h) + '</th>'; }).join('') + '</tr></thead>' +
+  return '<div class="table-scroll"><table><thead><tr>' + headers.map(function (h) { return '<th>' + esc(h) + '</th>'; }).join('') + '</tr></thead>' +
     '<tbody>' + rows.map(function (row) {
       return '<tr>' + row.map(function (cell) { return '<td>' + cell + '</td>'; }).join('') + '</tr>';
-    }).join('') + '</tbody></table>';
+    }).join('') + '</tbody></table></div>';
 }
 
 /* ================= MARK ATTENDANCE ================= */
