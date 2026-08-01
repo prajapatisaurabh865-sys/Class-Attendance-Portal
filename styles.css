@@ -1,4 +1,4 @@
-  :root {
+:root {
     --primary: #4f46e5;
     --primary-dark: #4338ca;
     --primary-light: #eef2ff;
@@ -31,7 +31,7 @@
     background: linear-gradient(135deg, var(--primary) 0%, #7c3aed 100%);
   }
   .login-card {
-    background: var(--card); border-radius: 16px; padding: 40px; width: 360px;
+    background: var(--card); border-radius: 16px; padding: 40px; width: 360px; max-width: 90vw;
     box-shadow: 0 20px 60px rgba(0,0,0,0.25);
   }
   .login-card h1 { font-size: 20px; margin: 0 0 4px; }
@@ -88,7 +88,8 @@
   .field-row { display: flex; gap: 12px; }
   .field-row > .field { flex: 1; }
 
-  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; min-width: 480px; }
   th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); }
   th { color: var(--text-muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
   tr:hover td { background: #fafafa; }
@@ -137,3 +138,72 @@
   .flex-between { display: flex; align-items: center; justify-content: space-between; }
   .export-row { display: flex; gap: 8px; }
   a.link { color: var(--primary); cursor: pointer; text-decoration: none; font-weight: 600; font-size: 13px; }
+
+  /* ================================================================
+     RESPONSIVE — laptop (default above), tablet, and mobile
+  ================================================================= */
+
+  /* ---- Tablet & below: sidebar becomes a horizontal scrollable top bar ---- */
+  @media (max-width: 900px) {
+    #app { flex-direction: column; min-height: 100vh; }
+    .sidebar {
+      width: 100%; flex-direction: row; align-items: center; padding: 10px 8px;
+      overflow-x: auto; -webkit-overflow-scrolling: touch; flex-shrink: 0;
+    }
+    .sidebar .brand {
+      padding: 0 14px 0 6px; border-bottom: none; margin-bottom: 0; border-right: 1px solid #1f2937;
+      white-space: nowrap; flex-shrink: 0;
+    }
+    .sidebar .brand small { display: none; }
+    .nav-item {
+      padding: 8px 12px; border-left: none; border-bottom: 3px solid transparent;
+      white-space: nowrap; flex-shrink: 0;
+    }
+    .nav-item.active { border-left-color: transparent; border-bottom-color: var(--primary); }
+    .sidebar-footer {
+      margin-top: 0; padding: 0 0 0 14px; border-top: none; border-left: 1px solid #1f2937;
+      white-space: nowrap; flex-shrink: 0; margin-left: auto;
+    }
+    .sidebar-footer br { display: none; }
+    .sidebar-footer a.link { margin-left: 8px; }
+
+    .content { padding: 16px; }
+    .topbar { padding: 12px 16px; }
+  }
+
+  /* ---- Mobile ---- */
+  @media (max-width: 600px) {
+    body { font-size: 13.5px; }
+    .topbar h2 { font-size: 15px; }
+    .topbar a.link { font-size: 12px; }
+    .content { padding: 12px; }
+    .card { padding: 14px; }
+
+    .field-row { flex-direction: column; gap: 0; }
+    .filters { flex-direction: column; align-items: stretch; }
+    .filters .field { min-width: 0; width: 100%; }
+
+    .stat-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .stat-card { padding: 12px; }
+    .stat-card .num { font-size: 20px; }
+
+    .card-header { flex-direction: column; align-items: flex-start; gap: 10px; }
+    .card-header > div { width: 100%; }
+    .card-header .btn { width: 100%; justify-content: center; }
+
+    .attendance-row { flex-wrap: wrap; gap: 8px; }
+    .status-toggle { width: 100%; justify-content: space-between; }
+    .status-btn { flex: 1; text-align: center; }
+
+    .export-row { flex-wrap: wrap; }
+    .export-row .btn { flex: 1; justify-content: center; }
+    .flex-between { flex-wrap: wrap; gap: 10px; }
+
+    .modal { padding: 18px; width: 94vw; }
+    .login-card { padding: 26px; }
+
+    .sidebar { padding: 8px 6px; }
+    .sidebar .brand { font-size: 14px; padding-right: 10px; }
+    .nav-item { padding: 7px 10px; font-size: 12.5px; }
+    .sidebar-footer { font-size: 11px; padding-left: 10px; }
+  }
