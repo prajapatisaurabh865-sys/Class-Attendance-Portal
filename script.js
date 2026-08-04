@@ -5,7 +5,7 @@
 
 // 1. Deploy the backend-apps-script project as a Web App (Execute as: Me, Who has access: Anyone)
 // 2. Paste that deployment URL (ends in /exec) below, between the quotes.
-const SCRIPT_URL = 'PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE';
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwMHYucealGRS3rHaMCqIUBSNjdOSLpA2SrIb1JnSeSXL0G9BbKBmVp1Zmy4YyJCSt7/exec';
 
 const state = {
   user: null,
