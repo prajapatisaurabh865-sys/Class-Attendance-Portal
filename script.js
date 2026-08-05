@@ -14,18 +14,14 @@ const state = {
   view: 'home'
 };
 
-/** POSTs { fn, args } to our own deployed URL's doPost() and returns a promise.
- *  Deliberately NOT using google.script.run — on some browsers/deployments
- *  Google has been mis-serving its callback response as a file download
- *  ("response.bin"), which silently breaks every call. Plain fetch() to our
- *  own doPost() endpoint sidesteps that entirely. */
+/** GETs SCRIPT_URL?fn=...&args=... and returns a promise.
+ *  Uses GET, not POST: Apps Script's /exec URL responds with a redirect, and
+ *  browsers silently downgrade POST to GET (dropping the body) when following
+ *  it — that's why login kept "doing nothing". GET survives the redirect fine. */
 function gs(fnName) {
   const args = Array.prototype.slice.call(arguments, 1);
-  return fetch(SCRIPT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids a CORS preflight
-    body: JSON.stringify({ fn: fnName, args: args })
-  })
+  const url = SCRIPT_URL + '?fn=' + encodeURIComponent(fnName) + '&args=' + encodeURIComponent(JSON.stringify(args));
+  return fetch(url)
     .then(function (resp) { return resp.json(); })
     .then(function (json) {
       if (!json.ok) throw new Error(json.error || 'Server error');
