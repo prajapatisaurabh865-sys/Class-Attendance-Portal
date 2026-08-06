@@ -29,6 +29,37 @@ function gs(fnName) {
     });
 }
 
+/* ================= CACHE (stale-while-revalidate) =================
+   Every gsSWR call shows cached data instantly (if any), then quietly
+   fetches the live version in the background and calls onData again
+   when it arrives — so switching pages feels instant even though the
+   real data is still coming from Sheets/Apps Script underneath. */
+
+const CACHE_PREFIX = 'attmgr:';
+
+function getCache(key) {
+  try {
+    const raw = localStorage.getItem(CACHE_PREFIX + key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+function setCache(key, data) {
+  try { localStorage.setItem(CACHE_PREFIX + key, JSON.stringify(data)); } catch (e) { /* storage full/unavailable — fine, just skip caching */ }
+}
+
+/** cacheKey: string. fnName/args: what to call via gs(). onData(data, isFresh) fires
+ *  once immediately with cached data (if present), and again when the live call returns. */
+function gsSWR(cacheKey, fnName, args, onData) {
+  const cached = getCache(cacheKey);
+  if (cached) onData(cached, false);
+  gs.apply(null, [fnName].concat(args)).then(function (fresh) {
+    setCache(cacheKey, fresh);
+    onData(fresh, true);
+  }).catch(function (e) {
+    if (!cached) toast(e.message || String(e), 'error');
+  });
+}
+
 function toast(msg, type) {
   const el = document.createElement('div');
   el.className = 'toast' + (type ? ' ' + type : '');
@@ -77,14 +108,14 @@ function logout() { state.user = null; renderLogin(); }
 /* ================= BOOT + SHELL ================= */
 
 function boot() {
-  gs('getBootstrapData').then(function (data) {
+  state.view = 'home';
+  gsSWR('bootstrap', 'getBootstrapData', [], function (data) {
     state.batches = data.batches;
     state.subjects = data.subjects;
     state.students = data.students;
     state.instituteName = data.instituteName;
     state.defaulterThreshold = data.defaulterThreshold;
-    state.view = 'home';
-    renderShell();
+    if (!document.querySelector('.modal-overlay')) renderShell();
   });
 }
 
@@ -93,6 +124,8 @@ function refreshData() {
     state.batches = data.batches;
     state.subjects = data.subjects;
     state.students = data.students;
+    const cached = getCache('bootstrap') || {};
+    setCache('bootstrap', Object.assign({}, cached, { batches: data.batches, subjects: data.subjects, students: data.students }));
   });
 }
 
@@ -150,8 +183,10 @@ function myBatches() {
 
 function renderHome() {
   const content = document.getElementById('content');
-  content.innerHTML = '<div class="empty-state">Loading…</div>';
-  gs('getDefaultersReport', {}).then(function (defaulters) {
+  const cached = getCache('defaulters');
+  if (!cached) content.innerHTML = '<div class="empty-state">Loading…</div>';
+  gsSWR('defaulters', 'getDefaultersReport', [{}], function (defaulters) {
+    if (state.view !== 'home') return; // user already navigated away
     content.innerHTML =
       '<div class="stat-grid">' +
         statCard(myBatches().length, 'Batches') +
@@ -274,8 +309,18 @@ function saveSession() {
     return { studentId: row.getAttribute('data-student'), status: selected ? selected.getAttribute('data-status') : 'Present' };
   });
   gs('submitAttendance', state.user, date, batchId, subjectId, records).then(function () {
+    clearAttendanceCaches();
     toast('Attendance saved for ' + records.length + ' students', 'success');
   }).catch(function (e) { toast(e.message || String(e), 'error'); });
+}
+
+/** Attendance changed — any cached records/reports/home numbers are now stale. */
+function clearAttendanceCaches() {
+  try {
+    Object.keys(localStorage)
+      .filter(function (k) { return k.indexOf(CACHE_PREFIX + 'records:') === 0 || k.indexOf(CACHE_PREFIX + 'report:') === 0 || k === CACHE_PREFIX + 'defaulters'; })
+      .forEach(function (k) { localStorage.removeItem(k); });
+  } catch (e) { /* fine, worst case a stale view shows briefly */ }
 }
 
 /* ================= RECORDS ================= */
@@ -315,11 +360,10 @@ function loadRecords() {
     from: document.getElementById('recFrom').value,
     to: document.getElementById('recTo').value
   };
-  if (state.user.role !== 'Admin' && !filters.batchId) {
-    // Teachers only ever see their own batches even with "All" selected.
-  }
-  document.getElementById('recTable').innerHTML = '<div class="empty-state">Loading…</div>';
-  gs('getAttendanceRecords', filters).then(function (records) {
+  const cacheKey = 'records:' + JSON.stringify(filters);
+  if (!getCache(cacheKey)) document.getElementById('recTable').innerHTML = '<div class="empty-state">Loading…</div>';
+  gsSWR(cacheKey, 'getAttendanceRecords', [filters], function (records) {
+    if (state.view !== 'records') return;
     if (state.user.role !== 'Admin') {
       const allowedBatchNames = myBatches().map(function (b) { return b.Name; });
       records = records.filter(function (r) { return allowedBatchNames.indexOf(r.batchName) !== -1; });
@@ -396,8 +440,10 @@ function loadReport() {
     to: document.getElementById('repTo').value
   };
   const fn = type === 'student' ? 'getStudentWiseReport' : type === 'batch' ? 'getBatchWiseReport' : 'getDefaultersReport';
-  document.getElementById('repTable').innerHTML = '<div class="empty-state">Loading…</div>';
-  gs(fn, filters).then(function (data) {
+  const cacheKey = 'report:' + type + ':' + JSON.stringify(filters);
+  if (!getCache(cacheKey)) document.getElementById('repTable').innerHTML = '<div class="empty-state">Loading…</div>';
+  gsSWR(cacheKey, fn, [filters], function (data) {
+    if (state.view !== 'reports') return;
     document.getElementById('repCount').textContent = data.length + ' row(s)';
     let headers, rows, displayRows;
     if (type === 'batch') {
@@ -549,8 +595,10 @@ function openBulkImport() {
 
 function renderTeachers() {
   const content = document.getElementById('content');
-  content.innerHTML = '<div class="card"><div class="empty-state">Loading…</div></div>';
-  gs('listUsers', state.user.role).then(function (users) {
+  const cached = getCache('users');
+  if (!cached) content.innerHTML = '<div class="card"><div class="empty-state">Loading…</div></div>';
+  gsSWR('users', 'listUsers', [state.user.role], function (users) {
+    if (state.view !== 'teachers') return;
     const batchNames = function (ids) { return ids.map(function (id) { const b = state.batches.find(function (x) { return x.ID === id; }); return b ? b.Name : ''; }).filter(Boolean).join(', ') || '—'; };
     content.innerHTML =
       '<div class="card">' +
