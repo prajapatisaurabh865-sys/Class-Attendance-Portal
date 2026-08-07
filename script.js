@@ -68,6 +68,30 @@ function toast(msg, type) {
   setTimeout(function () { el.remove(); }, 3200);
 }
 
+/** Puts a button into a disabled/spinner state while fn() runs, so a slow
+ *  request can't be double-clicked into firing twice, and the person can see
+ *  something is happening. fn() may return a promise or nothing (e.g. it bailed
+ *  out on a validation error) — either way the button resets itself after. */
+function runWithLoading(btn, loadingText, fn) {
+  if (!btn) return fn();
+  const isLink = btn.tagName === 'A';
+  const originalText = btn.textContent;
+  if (isLink) { btn.classList.add('link-disabled'); } else { btn.disabled = true; btn.classList.add('btn-loading'); }
+  btn.textContent = loadingText;
+  const reset = function () {
+    if (!btn) return;
+    if (isLink) { btn.classList.remove('link-disabled'); } else { btn.disabled = false; btn.classList.remove('btn-loading'); }
+    btn.textContent = originalText;
+  };
+  const result = fn();
+  if (result && typeof result.then === 'function') {
+    result.then(reset, reset);
+  } else {
+    reset();
+  }
+  return result;
+}
+
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
   return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
 }); }
@@ -232,7 +256,7 @@ function renderMark() {
         '</select></div>' +
         '<div class="field"><label>Subject</label><select id="markSubject"></select></div>' +
         '<div class="field"><label>Date</label><input type="date" id="markDate" value="' + todayStr() + '"></div>' +
-        '<div class="field"><button class="btn btn-primary" onclick="loadSession()">Load session</button></div>' +
+        '<div class="field"><button class="btn btn-primary" onclick="loadSession(this)">Load session</button></div>' +
       '</div>' +
     '</div>' +
     '<div id="sessionArea"></div>';
@@ -243,12 +267,12 @@ function onMarkBatchChange() {
   const batchId = document.getElementById('markBatch').value;
   const subjects = state.subjects.filter(function (s) { return s.BatchID === batchId; });
   const sel = document.getElementById('markSubject');
-  sel.innerHTML = subjects.length
-    ? subjects.map(function (s) { return '<option value="' + s.ID + '">' + esc(s.Name) + '</option>'; }).join('')
-    : '<option value="">No subjects for this batch</option>';
+  const allOption = '<option value="__ALL__">All Subjects</option>';
+  sel.innerHTML = allOption + subjects.map(function (s) { return '<option value="' + s.ID + '">' + esc(s.Name) + '</option>'; }).join('');
+  sel.value = '__ALL__'; // always defaults here — marking one subject differently doesn't change this default
 }
 
-function loadSession() {
+function loadSession(btn) {
   const batchId = document.getElementById('markBatch').value;
   const subjectId = document.getElementById('markSubject').value;
   const date = document.getElementById('markDate').value;
@@ -260,11 +284,8 @@ function loadSession() {
     return;
   }
 
-  document.getElementById('sessionArea').innerHTML = '<div class="empty-state">Loading session…</div>';
-  gs('getSessionAttendance', batchId, subjectId, date).then(function (existing) {
-    const existingByStudent = {};
-    existing.forEach(function (r) { existingByStudent[r.StudentID] = r.Status; });
-
+  const isAllSubjects = subjectId === '__ALL__';
+  const renderRoster = function (existingByStudent) {
     const rows = roster.map(function (s) {
       const status = existingByStudent[s.ID] || 'Present';
       return '<div class="attendance-row" data-student="' + s.ID + '">' +
@@ -277,14 +298,36 @@ function loadSession() {
         '</div></div>';
     }).join('');
 
+    const heading = isAllSubjects
+      ? roster.length + ' students — marking ALL subjects at once'
+      : roster.length + ' students';
+    const subNote = isAllSubjects
+      ? '<p class="muted" style="margin:-8px 0 14px">This marks every subject for this batch on this date in one go. To make one student absent in just one subject, switch Subject above to that specific subject, mark it, and save — it won\'t affect the others.</p>'
+      : '';
+
     document.getElementById('sessionArea').innerHTML =
       '<div class="card">' +
-        '<div class="card-header"><h3>' + roster.length + ' students</h3>' +
+        '<div class="card-header"><h3>' + heading + '</h3>' +
           '<div><button class="btn btn-secondary btn-sm" onclick="markAll(\'Present\')">All present</button> ' +
           '<button class="btn btn-secondary btn-sm" onclick="markAll(\'Absent\')">All absent</button></div></div>' +
+        subNote +
         '<div id="rosterList">' + rows + '</div>' +
-        '<div style="margin-top:16px;text-align:right"><button class="btn btn-primary" onclick="saveSession()">Save attendance</button></div>' +
+        '<div style="margin-top:16px;text-align:right"><button class="btn btn-primary" onclick="saveSession(this)">Save attendance</button></div>' +
       '</div>';
+  };
+
+  document.getElementById('sessionArea').innerHTML = '<div class="empty-state">Loading session…</div>';
+  runWithLoading(btn, 'Loading…', function () {
+    if (isAllSubjects) {
+      // Nothing single-subject to prefill from — start everyone at Present for this fresh bulk pass.
+      renderRoster({});
+      return null;
+    }
+    return gs('getSessionAttendance', batchId, subjectId, date).then(function (existing) {
+      const existingByStudent = {};
+      existing.forEach(function (r) { existingByStudent[r.StudentID] = r.Status; });
+      renderRoster(existingByStudent);
+    });
   });
 }
 
@@ -300,7 +343,7 @@ function markAll(status) {
   });
 }
 
-function saveSession() {
+function saveSession(btn) {
   const batchId = document.getElementById('markBatch').value;
   const subjectId = document.getElementById('markSubject').value;
   const date = document.getElementById('markDate').value;
@@ -308,10 +351,25 @@ function saveSession() {
     const selected = row.querySelector('.status-btn.selected');
     return { studentId: row.getAttribute('data-student'), status: selected ? selected.getAttribute('data-status') : 'Present' };
   });
-  gs('submitAttendance', state.user, date, batchId, subjectId, records).then(function () {
+
+  const isAllSubjects = subjectId === '__ALL__';
+  const targetSubjectIds = isAllSubjects
+    ? state.subjects.filter(function (s) { return s.BatchID === batchId; }).map(function (s) { return s.ID; })
+    : [subjectId];
+
+  if (isAllSubjects && !targetSubjectIds.length) {
+    toast('This batch has no subjects yet — add one from Subjects first', 'error');
+    return;
+  }
+
+  const task = Promise.all(targetSubjectIds.map(function (sid) {
+    return gs('submitAttendance', state.user, date, batchId, sid, records);
+  })).then(function () {
     clearAttendanceCaches();
-    toast('Attendance saved for ' + records.length + ' students', 'success');
+    toast('Attendance saved for ' + records.length + ' students' + (isAllSubjects ? ' across ' + targetSubjectIds.length + ' subjects' : ''), 'success');
   }).catch(function (e) { toast(e.message || String(e), 'error'); });
+
+  if (btn) runWithLoading(btn, 'Saving…', function () { return task; });
 }
 
 /** Attendance changed — any cached records/reports/home numbers are now stale. */
@@ -470,7 +528,7 @@ function renderBatches() {
       renderTable(['Name', 'Description', ''], state.batches.map(function (b) {
         return [esc(b.Name), esc(b.Description || ''),
           '<a class="link" onclick=\'openBatchModal(' + JSON.stringify(b.ID) + ')\'>Edit</a> &nbsp; ' +
-          '<a class="link" style="color:#dc2626" onclick="deleteBatchConfirm(\'' + b.ID + '\')">Delete</a>'];
+          '<a class="link" style="color:#dc2626" onclick="deleteBatchConfirm(this,\'' + b.ID + '\')">Delete</a>'];
       })) +
     '</div>';
 }
@@ -484,12 +542,14 @@ function openBatchModal(id) {
       const data = { name: document.getElementById('bName').value.trim(), description: document.getElementById('bDesc').value.trim() };
       if (!data.name) { toast('Name is required', 'error'); return; }
       const call = batch ? gs('updateBatch', state.user.role, Object.assign({ id: batch.ID }, data)) : gs('createBatch', state.user.role, data);
-      call.then(function () { closeModal(); return refreshData(); }).then(function () { renderBatches(); toast('Saved', 'success'); });
+      return call.then(function () { closeModal(); return refreshData(); }).then(function () { renderBatches(); toast('Saved', 'success'); });
     });
 }
-function deleteBatchConfirm(id) {
+function deleteBatchConfirm(el, id) {
   if (!confirm('Delete this batch? Students/subjects in it will remain but be unassigned.')) return;
-  gs('deleteBatch', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderBatches(); toast('Deleted', 'success'); });
+  runWithLoading(el, 'Deleting…', function () {
+    return gs('deleteBatch', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderBatches(); toast('Deleted', 'success'); });
+  });
 }
 
 /* ================= SUBJECTS (admin) ================= */
@@ -503,7 +563,7 @@ function renderSubjects() {
       renderTable(['Name', 'Batch', ''], state.subjects.map(function (s) {
         return [esc(s.Name), esc(batchName(s.BatchID)),
           '<a class="link" onclick=\'openSubjectModal(' + JSON.stringify(s.ID) + ')\'>Edit</a> &nbsp; ' +
-          '<a class="link" style="color:#dc2626" onclick="deleteSubjectConfirm(\'' + s.ID + '\')">Delete</a>'];
+          '<a class="link" style="color:#dc2626" onclick="deleteSubjectConfirm(this,\'' + s.ID + '\')">Delete</a>'];
       })) +
     '</div>';
 }
@@ -518,12 +578,14 @@ function openSubjectModal(id) {
       const data = { name: document.getElementById('sName').value.trim(), batchId: document.getElementById('sBatch').value };
       if (!data.name) { toast('Name is required', 'error'); return; }
       const call = subject ? gs('updateSubject', state.user.role, Object.assign({ id: subject.ID }, data)) : gs('createSubject', state.user.role, data);
-      call.then(function () { closeModal(); return refreshData(); }).then(function () { renderSubjects(); toast('Saved', 'success'); });
+      return call.then(function () { closeModal(); return refreshData(); }).then(function () { renderSubjects(); toast('Saved', 'success'); });
     });
 }
-function deleteSubjectConfirm(id) {
+function deleteSubjectConfirm(el, id) {
   if (!confirm('Delete this subject?')) return;
-  gs('deleteSubject', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderSubjects(); toast('Deleted', 'success'); });
+  runWithLoading(el, 'Deleting…', function () {
+    return gs('deleteSubject', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderSubjects(); toast('Deleted', 'success'); });
+  });
 }
 
 /* ================= STUDENTS (admin) ================= */
@@ -539,7 +601,7 @@ function renderStudents() {
       renderTable(['Name', 'Roll No', 'Batch', 'Phone', ''], state.students.map(function (s) {
         return [esc(s.Name), esc(s.RollNo || ''), esc(batchName(s.BatchID)), esc(s.Phone || ''),
           '<a class="link" onclick=\'openStudentModal(' + JSON.stringify(s.ID) + ')\'>Edit</a> &nbsp; ' +
-          '<a class="link" style="color:#dc2626" onclick="deleteStudentConfirm(\'' + s.ID + '\')">Delete</a>'];
+          '<a class="link" style="color:#dc2626" onclick="deleteStudentConfirm(this,\'' + s.ID + '\')">Delete</a>'];
       })) +
     '</div>';
 }
@@ -567,12 +629,14 @@ function openStudentModal(id) {
       };
       if (!data.name) { toast('Name is required', 'error'); return; }
       const call = student ? gs('updateStudent', state.user.role, Object.assign({ id: student.ID }, data)) : gs('createStudent', state.user.role, data);
-      call.then(function () { closeModal(); return refreshData(); }).then(function () { renderStudents(); toast('Saved', 'success'); });
+      return call.then(function () { closeModal(); return refreshData(); }).then(function () { renderStudents(); toast('Saved', 'success'); });
     });
 }
-function deleteStudentConfirm(id) {
+function deleteStudentConfirm(el, id) {
   if (!confirm('Delete this student? Their past attendance history is kept.')) return;
-  gs('deleteStudent', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderStudents(); toast('Deleted', 'success'); });
+  runWithLoading(el, 'Deleting…', function () {
+    return gs('deleteStudent', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderStudents(); toast('Deleted', 'success'); });
+  });
 }
 function openBulkImport() {
   showModal('bulkModal', 'Bulk import students',
@@ -585,7 +649,7 @@ function openBulkImport() {
       const batchId = document.getElementById('biBatch').value;
       const text = document.getElementById('biText').value.trim();
       if (!text) { toast('Paste at least one row', 'error'); return; }
-      gs('bulkImportStudents', state.user.role, batchId, text).then(function (res) {
+      return gs('bulkImportStudents', state.user.role, batchId, text).then(function (res) {
         closeModal(); return refreshData().then(function () { renderStudents(); toast('Imported ' + res.count + ' students', 'success'); });
       });
     });
@@ -607,7 +671,7 @@ function renderTeachers() {
           return [esc(u.name), esc(u.username), esc(u.role), esc(batchNames(u.assignedBatchIds)),
             u.active ? '<span class="badge badge-success">Active</span>' : '<span class="badge badge-neutral">Disabled</span>',
             '<a class="link" onclick=\'openUserModal(' + JSON.stringify(u.id) + ')\'>Edit</a> &nbsp; ' +
-            (u.username !== 'admin' ? '<a class="link" style="color:#dc2626" onclick="deleteUserConfirm(\'' + u.id + '\')">Delete</a>' : '')];
+            (u.username !== 'admin' ? '<a class="link" style="color:#dc2626" onclick="deleteUserConfirm(this,\'' + u.id + '\')">Delete</a>' : '')];
         })) +
       '</div>';
   });
@@ -635,13 +699,13 @@ function openUserModal(id) {
         const role = document.getElementById('uRole').value;
         const password = document.getElementById('uPassword').value;
         if (u) {
-          gs('updateUser', state.user.role, { id: u.id, name: document.getElementById('uName').value.trim(), role: role, assignedBatchIds: assignedBatchIds, newPassword: password || null })
+          return gs('updateUser', state.user.role, { id: u.id, name: document.getElementById('uName').value.trim(), role: role, assignedBatchIds: assignedBatchIds, newPassword: password || null })
             .then(function (res) { finishUserSave(res); });
         } else {
           const name = document.getElementById('uName').value.trim();
           const username = document.getElementById('uUsername').value.trim();
           if (!name || !username || !password) { toast('Name, username, and password are required', 'error'); return; }
-          gs('createUser', state.user.role, { name: name, username: username, password: password, role: role, assignedBatchIds: assignedBatchIds })
+          return gs('createUser', state.user.role, { name: name, username: username, password: password, role: role, assignedBatchIds: assignedBatchIds })
             .then(function (res) { finishUserSave(res); });
         }
       });
@@ -656,9 +720,11 @@ function toggleBatchPicker() {
   const role = document.getElementById('uRole').value;
   document.getElementById('batchPickerWrap').style.display = role === 'Admin' ? 'none' : 'block';
 }
-function deleteUserConfirm(id) {
+function deleteUserConfirm(el, id) {
   if (!confirm('Delete this login?')) return;
-  gs('deleteUser', state.user.role, id).then(function () { renderTeachers(); toast('Deleted', 'success'); });
+  runWithLoading(el, 'Deleting…', function () {
+    return gs('deleteUser', state.user.role, id).then(function () { renderTeachers(); toast('Deleted', 'success'); });
+  });
 }
 
 /* ================= SETTINGS (admin) ================= */
@@ -670,14 +736,15 @@ function renderSettings() {
       '<h3>Institute settings</h3>' +
       '<div class="field"><label>Institute name</label><input id="setName" value="' + esc(state.instituteName) + '"></div>' +
       '<div class="field"><label>Defaulter threshold (%)</label><input id="setThreshold" type="number" min="0" max="100" value="' + state.defaulterThreshold + '"></div>' +
-      '<button class="btn btn-primary" onclick="saveSettings()">Save</button>' +
+      '<button class="btn btn-primary" onclick="saveSettings(this)">Save</button>' +
     '</div>';
 }
-function saveSettings() {
-  gs('updateSettings', state.user.role, {
+function saveSettings(btn) {
+  const task = gs('updateSettings', state.user.role, {
     instituteName: document.getElementById('setName').value.trim(),
     defaulterThreshold: Number(document.getElementById('setThreshold').value)
   }).then(function () { return refreshData(); }).then(function () { renderShell(); toast('Saved', 'success'); });
+  runWithLoading(btn, 'Saving…', function () { return task; });
 }
 
 /* ================= CHANGE PASSWORD (all users) ================= */
@@ -689,7 +756,7 @@ function openChangePassword() {
     function () {
       const oldP = document.getElementById('pwOld').value, newP = document.getElementById('pwNew').value;
       if (!newP || newP.length < 4) { toast('New password should be at least 4 characters', 'error'); return; }
-      gs('changeOwnPassword', state.user.id, oldP, newP).then(function (res) {
+      return gs('changeOwnPassword', state.user.id, oldP, newP).then(function (res) {
         if (res.error) { toast(res.error, 'error'); return; }
         closeModal(); toast('Password updated', 'success');
       });
@@ -708,7 +775,9 @@ function showModal(id, title, bodyHtml, onSave) {
       '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">Cancel</button>' +
       '<button class="btn btn-primary" id="modalSaveBtn">Save</button></div></div>';
   document.body.appendChild(overlay);
-  document.getElementById('modalSaveBtn').addEventListener('click', onSave);
+  document.getElementById('modalSaveBtn').addEventListener('click', function () {
+    runWithLoading(document.getElementById('modalSaveBtn'), 'Saving…', onSave);
+  });
 }
 function closeModal() {
   document.querySelectorAll('.modal-overlay').forEach(function (m) { m.remove(); });
