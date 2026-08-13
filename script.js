@@ -643,16 +643,44 @@ function openBulkImport() {
     '<div class="field"><label>Batch</label><select id="biBatch">' +
       state.batches.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') +
     '</select></div>' +
-    '<div class="field"><label>Paste rows — one student per line: Name, Roll No, Phone, Email</label>' +
-      '<textarea id="biText" rows="8" placeholder="Riya Sharma, 101, 9876543210, riya@example.com"></textarea></div>',
+    '<div class="field">' +
+      '<label>Upload a CSV file</label>' +
+      '<input type="file" id="biFile" accept=".csv,text/csv" onchange="handleCsvFileSelect(this)">' +
+      '<div style="margin-top:6px"><a class="link" onclick="downloadSampleCsv()">Download sample CSV</a></div>' +
+    '</div>' +
+    '<div class="field"><label>...or paste rows — one student per line: Name, Roll No, Phone, Email</label>' +
+      '<textarea id="biText" rows="8" placeholder="Riya Sharma, 101, 9876543210, riya@example.com"></textarea></div>' +
+    '<div id="biPreview" class="muted" style="font-size:12.5px"></div>',
     function () {
       const batchId = document.getElementById('biBatch').value;
       const text = document.getElementById('biText').value.trim();
-      if (!text) { toast('Paste at least one row', 'error'); return; }
+      if (!text) { toast('Upload a CSV or paste at least one row', 'error'); return; }
       return gs('bulkImportStudents', state.user.role, batchId, text).then(function (res) {
         closeModal(); return refreshData().then(function () { renderStudents(); toast('Imported ' + res.count + ' students', 'success'); });
       });
     });
+}
+
+/** CSV file → drops its contents straight into the same textarea the paste path uses,
+ *  so both routes share one import call. Handles a trailing blank line from Excel/Sheets exports. */
+function handleCsvFileSelect(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function (e) {
+    const text = String(e.target.result || '').trim();
+    document.getElementById('biText').value = text;
+    const rowCount = text.split(/\r?\n/).filter(function (l) { return l.trim(); }).length;
+    document.getElementById('biPreview').textContent = file.name + ' loaded — ' + rowCount + ' row(s) ready to import.';
+  };
+  reader.onerror = function () { toast('Could not read that file', 'error'); };
+  reader.readAsText(file);
+}
+
+/** A ready-to-fill CSV so people know the exact column order/headers expected. */
+function downloadSampleCsv() {
+  const csv = 'Name,Roll No,Phone,Email\r\nRiya Sharma,101,9876543210,riya@example.com\r\nArjun Mehta,102,9876500000,arjun@example.com\r\n';
+  downloadBase64(btoa(unescape(encodeURIComponent(csv))), 'text/csv', 'students_sample.csv');
 }
 
 /* ================= TEACHERS & LOGINS (admin) ================= */
