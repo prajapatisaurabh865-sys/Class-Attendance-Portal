@@ -101,6 +101,14 @@ function todayStr() {
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 }
 
+/** Dates are stored/sent as yyyy-mm-dd (what <input type="date"> needs); this is
+ *  only for what people actually read on screen and in exports. */
+function fmtDate(isoDate) {
+  if (!isoDate || typeof isoDate !== 'string') return isoDate;
+  const m = isoDate.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? (m[3] + '/' + m[2] + '/' + m[1]) : isoDate;
+}
+
 /* ================= LOGIN ================= */
 
 function renderLogin() {
@@ -288,7 +296,8 @@ function loadSession(btn) {
   const renderRoster = function (existingByStudent) {
     const rows = roster.map(function (s) {
       const status = existingByStudent[s.ID] || 'Present';
-      return '<div class="attendance-row" data-student="' + s.ID + '">' +
+      const searchBlob = (s.Name + ' ' + (s.RollNo || '') + ' ' + (s.Phone || '')).toLowerCase();
+      return '<div class="attendance-row" data-student="' + s.ID + '" data-search="' + esc(searchBlob) + '">' +
         '<div>' + esc(s.Name) + (s.RollNo ? ' <span class="muted">(' + esc(s.RollNo) + ')</span>' : '') + '</div>' +
         '<div class="status-toggle">' +
           ['Present', 'Absent', 'Late'].map(function (st) {
@@ -311,7 +320,9 @@ function loadSession(btn) {
           '<div><button class="btn btn-secondary btn-sm" onclick="markAll(\'Present\')">All present</button> ' +
           '<button class="btn btn-secondary btn-sm" onclick="markAll(\'Absent\')">All absent</button></div></div>' +
         subNote +
+        '<div class="field" style="max-width:320px"><input type="text" id="rosterSearch" placeholder="Search by name, roll no, or phone…" oninput="filterRoster()"></div>' +
         '<div id="rosterList">' + rows + '</div>' +
+        '<div id="rosterEmpty" class="empty-state" style="display:none">No students match your search.</div>' +
         '<div style="margin-top:16px;text-align:right"><button class="btn btn-primary" onclick="saveSession(this)">Save attendance</button></div>' +
       '</div>';
   };
@@ -341,6 +352,19 @@ function markAll(status) {
     const btn = row.querySelector('[data-status="' + status + '"]');
     setStatus(btn, status);
   });
+}
+
+/** Just shows/hides rows — never touches their selected status, so searching
+ *  never loses marks already set on hidden students. */
+function filterRoster() {
+  const q = (document.getElementById('rosterSearch').value || '').trim().toLowerCase();
+  let visibleCount = 0;
+  document.querySelectorAll('.attendance-row').forEach(function (row) {
+    const match = !q || (row.getAttribute('data-search') || '').indexOf(q) !== -1;
+    row.style.display = match ? '' : 'none';
+    if (match) visibleCount++;
+  });
+  document.getElementById('rosterEmpty').style.display = visibleCount ? 'none' : 'block';
 }
 
 function saveSession(btn) {
@@ -428,7 +452,7 @@ function loadRecords() {
     }
     document.getElementById('recCount').textContent = records.length + ' record(s)';
     const headers = ['Date', 'Batch', 'Subject', 'Student', 'Roll No', 'Status', 'Marked By'];
-    const rows = records.map(function (r) { return [r.date, r.batchName, r.subjectName, r.studentName, r.rollNo, r.status, r.markedBy]; });
+    const rows = records.map(function (r) { return [fmtDate(r.date), r.batchName, r.subjectName, r.studentName, r.rollNo, r.status, r.markedBy]; });
     lastExportData = { title: 'Attendance_Records', headers: headers, rows: rows };
     document.getElementById('recTable').innerHTML = records.length
       ? renderTable(headers, rows.map(function (row) {
@@ -506,7 +530,7 @@ function loadReport() {
     let headers, rows, displayRows;
     if (type === 'batch') {
       headers = ['Date', 'Batch', 'Subject', 'Present', 'Absent', 'Late', 'Total'];
-      rows = data.map(function (r) { return [r.date, r.batchName, r.subjectName, r.present, r.absent, r.late, r.total]; });
+      rows = data.map(function (r) { return [fmtDate(r.date), r.batchName, r.subjectName, r.present, r.absent, r.late, r.total]; });
       displayRows = rows;
     } else {
       headers = ['Student', 'Roll No', 'Sessions', 'Present', 'Absent', '%'];
@@ -591,19 +615,32 @@ function deleteSubjectConfirm(el, id) {
 /* ================= STUDENTS (admin) ================= */
 
 function renderStudents() {
-  const batchName = function (id) { const b = state.batches.find(function (x) { return x.ID === id; }); return b ? b.Name : '(unassigned)'; };
   const content = document.getElementById('content');
   content.innerHTML =
     '<div class="card">' +
       '<div class="card-header"><h3>Students</h3><div>' +
         '<button class="btn btn-secondary btn-sm" onclick="openBulkImport()">Bulk import</button> ' +
         '<button class="btn btn-primary btn-sm" onclick="openStudentModal()">+ Add student</button></div></div>' +
-      renderTable(['Name', 'Roll No', 'Batch', 'Phone', ''], state.students.map(function (s) {
+      '<div class="field" style="max-width:320px"><input type="text" id="studentSearch" placeholder="Search by name, roll no, or phone…" oninput="renderStudentsTable()"></div>' +
+      '<div id="studentsTableArea"></div>' +
+    '</div>';
+  renderStudentsTable();
+}
+function renderStudentsTable() {
+  const batchName = function (id) { const b = state.batches.find(function (x) { return x.ID === id; }); return b ? b.Name : '(unassigned)'; };
+  const q = (document.getElementById('studentSearch').value || '').trim().toLowerCase();
+  const filtered = !q ? state.students : state.students.filter(function (s) {
+    return String(s.Name || '').toLowerCase().indexOf(q) !== -1 ||
+      String(s.RollNo || '').toLowerCase().indexOf(q) !== -1 ||
+      String(s.Phone || '').toLowerCase().indexOf(q) !== -1;
+  });
+  document.getElementById('studentsTableArea').innerHTML = filtered.length
+    ? renderTable(['Name', 'Roll No', 'Batch', 'Phone', ''], filtered.map(function (s) {
         return [esc(s.Name), esc(s.RollNo || ''), esc(batchName(s.BatchID)), esc(s.Phone || ''),
           '<a class="link" onclick=\'openStudentModal(' + JSON.stringify(s.ID) + ')\'>Edit</a> &nbsp; ' +
           '<a class="link" style="color:#dc2626" onclick="deleteStudentConfirm(this,\'' + s.ID + '\')">Delete</a>'];
-      })) +
-    '</div>';
+      }))
+    : '<div class="empty-state">No students match "' + esc(q) + '".</div>';
 }
 function openStudentModal(id) {
   const student = id ? state.students.find(function (s) { return s.ID === id; }) : null;
