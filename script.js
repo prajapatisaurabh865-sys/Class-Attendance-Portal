@@ -411,6 +411,9 @@ function renderRecords() {
   const batches = myBatches();
   const content = document.getElementById('content');
   content.innerHTML =
+    (state.user.role === 'Admin'
+      ? '<div class="card-header" style="margin-bottom:0"><div></div><button class="btn btn-secondary btn-sm" onclick="openBulkImportAttendance()">Bulk import attendance (CSV)</button></div>'
+      : '') +
     '<div class="card">' +
       '<div class="filters">' +
         '<div class="field"><label>Batch</label><select id="recBatch"><option value="">All</option>' +
@@ -451,12 +454,12 @@ function loadRecords() {
       records = records.filter(function (r) { return allowedBatchNames.indexOf(r.batchName) !== -1; });
     }
     document.getElementById('recCount').textContent = records.length + ' record(s)';
-    const headers = ['Date', 'Batch', 'Subject', 'Student', 'Roll No', 'Status', 'Marked By'];
-    const rows = records.map(function (r) { return [fmtDate(r.date), r.batchName, r.subjectName, r.studentName, r.rollNo, r.status, r.markedBy]; });
+    const headers = ['Date', 'Batch', 'Subject', 'Student', 'Roll No', 'Status', 'Marked By', 'Remark', 'Reason'];
+    const rows = records.map(function (r) { return [fmtDate(r.date), r.batchName, r.subjectName, r.studentName, r.rollNo, r.status, r.markedBy, r.remark, r.reason]; });
     lastExportData = { title: 'Attendance_Records', headers: headers, rows: rows };
     document.getElementById('recTable').innerHTML = records.length
-      ? renderTable(headers, rows.map(function (row) {
-          return row.slice(0, 5).concat([statusBadge(row[5]), row[6]]);
+      ? renderTable(['Date', 'Batch', 'Subject', 'Student', 'Roll No', 'Status', 'Marked By', 'Remark'], rows.map(function (row) {
+          return row.slice(0, 5).concat([statusBadge(row[5]), row[6], row[7]]);
         }))
       : '<div class="empty-state">No records match these filters.</div>';
   });
@@ -632,11 +635,12 @@ function renderStudentsTable() {
   const filtered = !q ? state.students : state.students.filter(function (s) {
     return String(s.Name || '').toLowerCase().indexOf(q) !== -1 ||
       String(s.RollNo || '').toLowerCase().indexOf(q) !== -1 ||
-      String(s.Phone || '').toLowerCase().indexOf(q) !== -1;
+      String(s.Phone || '').toLowerCase().indexOf(q) !== -1 ||
+      String(s.ParentPhone || '').toLowerCase().indexOf(q) !== -1;
   });
   document.getElementById('studentsTableArea').innerHTML = filtered.length
-    ? renderTable(['Name', 'Roll No', 'Batch', 'Phone', ''], filtered.map(function (s) {
-        return [esc(s.Name), esc(s.RollNo || ''), esc(batchName(s.BatchID)), esc(s.Phone || ''),
+    ? renderTable(['Name', 'Roll No', 'Batch', 'Phone', 'Parent Phone', ''], filtered.map(function (s) {
+        return [esc(s.Name), esc(s.RollNo || ''), esc(batchName(s.BatchID)), esc(s.Phone || ''), esc(s.ParentPhone || ''),
           '<a class="link" onclick=\'openStudentModal(' + JSON.stringify(s.ID) + ')\'>Edit</a> &nbsp; ' +
           '<a class="link" style="color:#dc2626" onclick="deleteStudentConfirm(this,\'' + s.ID + '\')">Delete</a>'];
       }))
@@ -653,15 +657,17 @@ function openStudentModal(id) {
       state.batches.map(function (b) { return '<option value="' + b.ID + '"' + (student && student.BatchID === b.ID ? ' selected' : '') + '>' + esc(b.Name) + '</option>'; }).join('') +
     '</select></div>' +
     '<div class="field-row">' +
-      '<div class="field"><label>Phone</label><input id="stPhone" value="' + esc(student ? student.Phone : '') + '"></div>' +
-      '<div class="field"><label>Email</label><input id="stEmail" value="' + esc(student ? student.Email : '') + '"></div>' +
-    '</div>',
+      '<div class="field"><label>Phone (student)</label><input id="stPhone" value="' + esc(student ? student.Phone : '') + '"></div>' +
+      '<div class="field"><label>Phone (parent)</label><input id="stParentPhone" value="' + esc(student ? student.ParentPhone : '') + '"></div>' +
+    '</div>' +
+    '<div class="field"><label>Email</label><input id="stEmail" value="' + esc(student ? student.Email : '') + '"></div>',
     function () {
       const data = {
         name: document.getElementById('stName').value.trim(),
         rollNo: document.getElementById('stRoll').value.trim(),
         batchId: document.getElementById('stBatch').value,
         phone: document.getElementById('stPhone').value.trim(),
+        parentPhone: document.getElementById('stParentPhone').value.trim(),
         email: document.getElementById('stEmail').value.trim()
       };
       if (!data.name) { toast('Name is required', 'error'); return; }
@@ -718,6 +724,57 @@ function handleCsvFileSelect(input) {
 function downloadSampleCsv() {
   const csv = 'Name,Roll No,Phone,Email\r\nRiya Sharma,101,9876543210,riya@example.com\r\nArjun Mehta,102,9876500000,arjun@example.com\r\n';
   downloadBase64(btoa(unescape(encodeURIComponent(csv))), 'text/csv', 'students_sample.csv');
+}
+
+/* ================= BULK ATTENDANCE IMPORT (admin, historical backfill) ================= */
+
+function openBulkImportAttendance() {
+  showModal('bulkAttModal', 'Bulk import attendance history',
+    '<p class="muted" style="margin-top:0">For importing months of past records at once. Batches, students, and the three class slots below are created automatically if they don\'t already exist — no need to set anything up first.</p>' +
+    '<div class="field">' +
+      '<label>Upload a CSV file</label>' +
+      '<input type="file" id="biaFile" accept=".csv,text/csv" onchange="handleAttendanceCsvFileSelect(this)">' +
+      '<div style="margin-top:6px"><a class="link" onclick="downloadSampleAttendanceCsv()">Download sample CSV</a></div>' +
+    '</div>' +
+    '<div class="field"><label>...or paste CSV rows directly</label>' +
+      '<textarea id="biaText" rows="6" placeholder="Riya Sharma,101,9876500001,9876543210,IIT JEE Excel-1,15/06/2026,Present,Absent,Present,,"></textarea></div>' +
+    '<div id="biaPreview" class="muted" style="font-size:12.5px"></div>' +
+    '<p class="muted" style="font-size:12px">Columns, in order: Name, Roll Number, Parent Mobile, Student Mobile, Batch, Date (dd/mm/yyyy), 1st Class, 2nd Class, 3rd Class, Remark, Reason. Leave a class column blank if that session didn\'t happen. Don\'t re-upload the same file twice — it will duplicate those rows.</p>',
+    function () {
+      const text = document.getElementById('biaText').value.trim();
+      if (!text) { toast('Upload a CSV or paste rows first', 'error'); return; }
+      return gs('bulkImportAttendance', state.user.role, text).then(function (res) {
+        closeModal();
+        clearAttendanceCaches();
+        return refreshData().then(function () {
+          renderRecords();
+          toast(res.attendanceRows + ' attendance record(s) imported' +
+            (res.newBatches || res.newStudents || res.newSubjects ? ' (' + res.newBatches + ' new batch(es), ' + res.newStudents + ' new student(s))' : '') +
+            (res.skippedRows ? ' — ' + res.skippedRows + ' row(s) skipped' : ''), 'success');
+        });
+      });
+    });
+}
+
+function handleAttendanceCsvFileSelect(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function (e) {
+    const text = String(e.target.result || '').trim();
+    document.getElementById('biaText').value = text;
+    const rowCount = text.split(/\r?\n/).filter(function (l) { return l.trim(); }).length;
+    document.getElementById('biaPreview').textContent = file.name + ' loaded — ' + rowCount + ' row(s) ready to import.';
+  };
+  reader.onerror = function () { toast('Could not read that file', 'error'); };
+  reader.readAsText(file);
+}
+
+function downloadSampleAttendanceCsv() {
+  const csv = 'Name,Roll Number,Parent Mobile,Student Mobile,Batch,Date,1st Class,2nd Class,3rd Class,Remark,Reason\r\n' +
+    'Riya Sharma,101,9876500001,9876543210,IIT JEE Excel-1,15/06/2026,Present,Present,Absent,Left early,"Had a family function in the evening, informed a day in advance"\r\n' +
+    'Arjun Mehta,102,9876500002,9876543211,IIT JEE Excel-1,15/06/2026,Absent,Absent,Absent,,Down with fever\r\n';
+  downloadBase64(btoa(unescape(encodeURIComponent(csv))), 'text/csv', 'attendance_history_sample.csv');
 }
 
 /* ================= TEACHERS & LOGINS (admin) ================= */
