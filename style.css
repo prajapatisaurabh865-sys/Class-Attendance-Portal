@@ -103,6 +103,31 @@
   th { color: var(--text-muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
   tr:hover td { background: #fafafa; }
 
+  /* Row highlight colors — for flagging a student's record after e.g. calling their parent */
+  tr.row-red td { background: #fef2f2; }
+  tr.row-red:hover td { background: #fee2e2; }
+  tr.row-yellow td { background: #fefce8; }
+  tr.row-yellow:hover td { background: #fef9c3; }
+  tr.row-green td { background: #f0fdf4; }
+  tr.row-green:hover td { background: #dcfce7; }
+  tr.row-blue td { background: #eff6ff; }
+  tr.row-blue:hover td { background: #dbeafe; }
+  tr.row-purple td { background: #faf5ff; }
+  tr.row-purple:hover td { background: #f3e8ff; }
+
+  .color-swatch-row { display: flex; gap: 10px; align-items: center; }
+  .color-swatch {
+    width: 26px; height: 26px; border-radius: 50%; cursor: pointer; padding: 0;
+    border: 2px solid transparent; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.08);
+  }
+  .color-swatch.selected { border-color: var(--text); }
+  .color-swatch.swatch-none { background: #fff; }
+  .color-swatch.swatch-red { background: #ef4444; }
+  .color-swatch.swatch-yellow { background: #eab308; }
+  .color-swatch.swatch-green { background: #22c55e; }
+  .color-swatch.swatch-blue { background: #3b82f6; }
+  .color-swatch.swatch-purple { background: #a855f7; }
+
   .badge { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 11.5px; font-weight: 700; }
   .badge-success { background: var(--success-light); color: var(--success); }
   .badge-danger { background: var(--danger-light); color: var(--danger); }
