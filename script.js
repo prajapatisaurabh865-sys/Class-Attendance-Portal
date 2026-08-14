@@ -438,6 +438,8 @@ function renderRecords() {
 
 let lastExportData = null; // { title, headers, rows }
 
+let lastRecordsById = {};
+
 function loadRecords() {
   const filters = {
     batchId: document.getElementById('recBatch').value,
@@ -457,13 +459,73 @@ function loadRecords() {
     const headers = ['Date', 'Batch', 'Subject', 'Student', 'Roll No', 'Status', 'Marked By', 'Remark', 'Reason'];
     const rows = records.map(function (r) { return [fmtDate(r.date), r.batchName, r.subjectName, r.studentName, r.rollNo, r.status, r.markedBy, r.remark, r.reason]; });
     lastExportData = { title: 'Attendance_Records', headers: headers, rows: rows };
-    document.getElementById('recTable').innerHTML = records.length
-      ? renderTable(['Date', 'Batch', 'Subject', 'Student', 'Roll No', 'Status', 'Marked By', 'Remark'], rows.map(function (row) {
-          return row.slice(0, 5).concat([statusBadge(row[5]), row[6], row[7]]);
-        }))
-      : '<div class="empty-state">No records match these filters.</div>';
+
+    lastRecordsById = {};
+    records.forEach(function (r) { lastRecordsById[r.id] = r; });
+
+    document.getElementById('recTable').innerHTML = records.length ? renderRecordsTable(records) : '<div class="empty-state">No records match these filters.</div>';
   });
 }
+
+function renderRecordsTable(records) {
+  const head = ['Date', 'Batch', 'Subject', 'Student', 'Phone', 'Parent Phone', 'Status', 'Remark', ''];
+  const rowsHtml = records.map(function (r) {
+    const studentCell = esc(r.studentName) + (r.rollNo ? ' <span class="muted">(' + esc(r.rollNo) + ')</span>' : '');
+    const cells = [
+      fmtDate(r.date), esc(r.batchName), esc(r.subjectName), studentCell,
+      r.studentPhone ? '<a href="tel:' + esc(r.studentPhone) + '" class="link">' + esc(r.studentPhone) + '</a>' : '<span class="muted">—</span>',
+      r.parentPhone ? '<a href="tel:' + esc(r.parentPhone) + '" class="link">' + esc(r.parentPhone) + '</a>' : '<span class="muted">—</span>',
+      statusBadge(r.status),
+      r.remark ? esc(r.remark) : '<span class="muted">—</span>',
+      '<a class="link" onclick=\'openEditRecordModal(' + JSON.stringify(r.id) + ')\'>Edit</a>'
+    ];
+    const rowClass = r.color ? ' class="row-' + esc(r.color) + '"' : '';
+    return '<tr' + rowClass + '>' + cells.map(function (c) { return '<td>' + c + '</td>'; }).join('') + '</tr>';
+  }).join('');
+  return '<div class="table-scroll"><table><thead><tr>' + head.map(function (h) { return '<th>' + esc(h) + '</th>'; }).join('') + '</tr></thead>' +
+    '<tbody>' + rowsHtml + '</tbody></table></div>';
+}
+
+/** Add a remark, reason, and/or a highlight color to one record — typically used
+ *  right after calling an absent student's parent, to log why and flag it for later. */
+function openEditRecordModal(id) {
+  const r = lastRecordsById[id];
+  if (!r) return;
+  const colors = [
+    { key: '', label: 'None' }, { key: 'red', label: 'Red' }, { key: 'yellow', label: 'Yellow' },
+    { key: 'green', label: 'Green' }, { key: 'blue', label: 'Blue' }, { key: 'purple', label: 'Purple' }
+  ];
+  showModal('editRecordModal', r.studentName + ' — ' + fmtDate(r.date) + ' (' + r.subjectName + ')',
+    '<div class="field"><label>Remark (short)</label><input id="erRemark" value="' + esc(r.remark) + '" placeholder="e.g. Called, informed a day in advance"></div>' +
+    '<div class="field"><label>Reason (detail)</label><textarea id="erReason" rows="4" placeholder="Longer note if needed">' + esc(r.reason) + '</textarea></div>' +
+    '<div class="field"><label>Highlight</label><div class="color-swatch-row">' +
+      colors.map(function (c) {
+        const selected = (r.color || '') === c.key ? ' selected' : '';
+        return '<button type="button" class="color-swatch swatch-' + (c.key || 'none') + selected + '" data-color="' + c.key + '" onclick="pickSwatch(this)" title="' + c.label + '"></button>';
+      }).join('') +
+    '</div></div>',
+    function () {
+      const selectedSwatch = document.querySelector('.color-swatch.selected');
+      const data = {
+        remark: document.getElementById('erRemark').value.trim(),
+        reason: document.getElementById('erReason').value.trim(),
+        color: selectedSwatch ? selectedSwatch.getAttribute('data-color') : ''
+      };
+      return gs('updateAttendanceRecord', state.user.role, id, data).then(function (res) {
+        if (res.error) { toast(res.error, 'error'); return; }
+        closeModal();
+        clearAttendanceCaches();
+        loadRecords();
+        toast('Saved', 'success');
+      });
+    });
+}
+function pickSwatch(btn) {
+  const group = btn.parentElement;
+  Array.prototype.forEach.call(group.children, function (b) { b.classList.remove('selected'); });
+  btn.classList.add('selected');
+}
+
 function statusBadge(status) {
   const cls = status === 'Present' ? 'badge-success' : status === 'Late' ? 'badge-warn' : 'badge-danger';
   return '<span class="badge ' + cls + '">' + esc(status) + '</span>';
