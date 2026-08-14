@@ -165,6 +165,7 @@ const NAV = [
   { id: 'home', label: 'Dashboard', roles: ['Admin', 'Teacher'] },
   { id: 'mark', label: 'Mark Attendance', roles: ['Admin', 'Teacher'] },
   { id: 'records', label: 'Records', roles: ['Admin', 'Teacher'] },
+  { id: 'calling', label: 'Absentee Calling', roles: ['Admin', 'Teacher'] },
   { id: 'reports', label: 'Reports', roles: ['Admin', 'Teacher'] },
   { id: 'batches', label: 'Batches', roles: ['Admin'] },
   { id: 'subjects', label: 'Subjects', roles: ['Admin'] },
@@ -198,10 +199,10 @@ function renderShell() {
 function setView(v) { state.view = v; renderShell(); }
 
 function renderView() {
-  const titles = { home: 'Dashboard', mark: 'Mark Attendance', records: 'Attendance Records', reports: 'Reports',
+  const titles = { home: 'Dashboard', mark: 'Mark Attendance', records: 'Attendance Records', calling: 'Absentee Calling', reports: 'Reports',
     batches: 'Batches', subjects: 'Subjects', students: 'Students', teachers: 'Teachers & Logins', settings: 'Settings' };
   document.getElementById('viewTitle').textContent = titles[state.view] || '';
-  const renderers = { home: renderHome, mark: renderMark, records: renderRecords, reports: renderReports,
+  const renderers = { home: renderHome, mark: renderMark, records: renderRecords, calling: renderCalling, reports: renderReports,
     batches: renderBatches, subjects: renderSubjects, students: renderStudents, teachers: renderTeachers, settings: renderSettings };
   (renderers[state.view] || renderHome)();
 }
@@ -438,8 +439,6 @@ function renderRecords() {
 
 let lastExportData = null; // { title, headers, rows }
 
-let lastRecordsById = {};
-
 function loadRecords() {
   const filters = {
     batchId: document.getElementById('recBatch').value,
@@ -459,26 +458,17 @@ function loadRecords() {
     const headers = ['Date', 'Batch', 'Subject', 'Student', 'Roll No', 'Status', 'Marked By', 'Remark', 'Reason'];
     const rows = records.map(function (r) { return [fmtDate(r.date), r.batchName, r.subjectName, r.studentName, r.rollNo, r.status, r.markedBy, r.remark, r.reason]; });
     lastExportData = { title: 'Attendance_Records', headers: headers, rows: rows };
-
-    lastRecordsById = {};
-    records.forEach(function (r) { lastRecordsById[r.id] = r; });
-
     document.getElementById('recTable').innerHTML = records.length ? renderRecordsTable(records) : '<div class="empty-state">No records match these filters.</div>';
   });
 }
 
+/** Read-only — rows just pick up a light tint if they were color-flagged from the
+ *  Absentee Calling page, so you can see follow-up status at a glance here too. */
 function renderRecordsTable(records) {
-  const head = ['Date', 'Batch', 'Subject', 'Student', 'Phone', 'Parent Phone', 'Status', 'Remark', ''];
+  const head = ['Date', 'Batch', 'Subject', 'Student', 'Roll No', 'Status', 'Marked By', 'Remark'];
   const rowsHtml = records.map(function (r) {
-    const studentCell = esc(r.studentName) + (r.rollNo ? ' <span class="muted">(' + esc(r.rollNo) + ')</span>' : '');
-    const cells = [
-      fmtDate(r.date), esc(r.batchName), esc(r.subjectName), studentCell,
-      r.studentPhone ? '<a href="tel:' + esc(r.studentPhone) + '" class="link">' + esc(r.studentPhone) + '</a>' : '<span class="muted">—</span>',
-      r.parentPhone ? '<a href="tel:' + esc(r.parentPhone) + '" class="link">' + esc(r.parentPhone) + '</a>' : '<span class="muted">—</span>',
-      statusBadge(r.status),
-      r.remark ? esc(r.remark) : '<span class="muted">—</span>',
-      '<a class="link" onclick=\'openEditRecordModal(' + JSON.stringify(r.id) + ')\'>Edit</a>'
-    ];
+    const cells = [fmtDate(r.date), esc(r.batchName), esc(r.subjectName), esc(r.studentName), esc(r.rollNo),
+      statusBadge(r.status), esc(r.markedBy), r.remark ? esc(r.remark) : '<span class="muted">—</span>'];
     const rowClass = r.color ? ' class="row-' + esc(r.color) + '"' : '';
     return '<tr' + rowClass + '>' + cells.map(function (c) { return '<td>' + c + '</td>'; }).join('') + '</tr>';
   }).join('');
@@ -486,40 +476,6 @@ function renderRecordsTable(records) {
     '<tbody>' + rowsHtml + '</tbody></table></div>';
 }
 
-/** Add a remark, reason, and/or a highlight color to one record — typically used
- *  right after calling an absent student's parent, to log why and flag it for later. */
-function openEditRecordModal(id) {
-  const r = lastRecordsById[id];
-  if (!r) return;
-  const colors = [
-    { key: '', label: 'None' }, { key: 'red', label: 'Red' }, { key: 'yellow', label: 'Yellow' },
-    { key: 'green', label: 'Green' }, { key: 'blue', label: 'Blue' }, { key: 'purple', label: 'Purple' }
-  ];
-  showModal('editRecordModal', r.studentName + ' — ' + fmtDate(r.date) + ' (' + r.subjectName + ')',
-    '<div class="field"><label>Remark (short)</label><input id="erRemark" value="' + esc(r.remark) + '" placeholder="e.g. Called, informed a day in advance"></div>' +
-    '<div class="field"><label>Reason (detail)</label><textarea id="erReason" rows="4" placeholder="Longer note if needed">' + esc(r.reason) + '</textarea></div>' +
-    '<div class="field"><label>Highlight</label><div class="color-swatch-row">' +
-      colors.map(function (c) {
-        const selected = (r.color || '') === c.key ? ' selected' : '';
-        return '<button type="button" class="color-swatch swatch-' + (c.key || 'none') + selected + '" data-color="' + c.key + '" onclick="pickSwatch(this)" title="' + c.label + '"></button>';
-      }).join('') +
-    '</div></div>',
-    function () {
-      const selectedSwatch = document.querySelector('.color-swatch.selected');
-      const data = {
-        remark: document.getElementById('erRemark').value.trim(),
-        reason: document.getElementById('erReason').value.trim(),
-        color: selectedSwatch ? selectedSwatch.getAttribute('data-color') : ''
-      };
-      return gs('updateAttendanceRecord', state.user.role, id, data).then(function (res) {
-        if (res.error) { toast(res.error, 'error'); return; }
-        closeModal();
-        clearAttendanceCaches();
-        loadRecords();
-        toast('Saved', 'success');
-      });
-    });
-}
 function pickSwatch(btn) {
   const group = btn.parentElement;
   Array.prototype.forEach.call(group.children, function (b) { b.classList.remove('selected'); });
@@ -529,6 +485,96 @@ function pickSwatch(btn) {
 function statusBadge(status) {
   const cls = status === 'Present' ? 'badge-success' : status === 'Late' ? 'badge-warn' : 'badge-danger';
   return '<span class="badge ' + cls + '">' + esc(status) + '</span>';
+}
+
+/* ================= ABSENTEE CALLING ================= */
+
+function renderCalling() {
+  const batches = myBatches();
+  const content = document.getElementById('content');
+  if (!batches.length) { content.innerHTML = '<div class="empty-state">No batches available.</div>'; return; }
+  content.innerHTML =
+    '<div class="card">' +
+      '<div class="filters">' +
+        '<div class="field"><label>Batch</label><select id="callBatch">' +
+          batches.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') +
+        '</select></div>' +
+        '<div class="field"><label>Date</label><input type="date" id="callDate" value="' + todayStr() + '"></div>' +
+        '<div class="field"><button class="btn btn-primary" onclick="loadAbsentees(this)">Load absentees</button></div>' +
+      '</div>' +
+    '</div>' +
+    '<div id="callingArea"></div>';
+}
+
+function loadAbsentees(btn) {
+  const batchId = document.getElementById('callBatch').value;
+  const date = document.getElementById('callDate').value;
+  if (!batchId || !date) { toast('Pick a batch and date first', 'error'); return; }
+  document.getElementById('callingArea').innerHTML = '<div class="empty-state">Loading…</div>';
+  runWithLoading(btn, 'Loading…', function () {
+    return gs('getAbsenteesForDate', batchId, date).then(function (absentees) {
+      renderAbsenteeList(absentees, batchId, date);
+    });
+  });
+}
+
+function renderAbsenteeList(absentees, batchId, date) {
+  const area = document.getElementById('callingArea');
+  if (!absentees.length) {
+    area.innerHTML = '<div class="empty-state">No absentees for this batch on ' + fmtDate(date) + ' 🎉</div>';
+    return;
+  }
+  const colors = [
+    { key: '', label: 'None' }, { key: 'red', label: 'No response' }, { key: 'yellow', label: 'Follow up' },
+    { key: 'green', label: 'Informed / OK' }, { key: 'blue', label: 'Excused' }, { key: 'purple', label: 'Other' }
+  ];
+  area.innerHTML =
+    '<div class="card"><h3 style="margin-top:0">' + absentees.length + ' absentee(s) — ' + fmtDate(date) + '</h3></div>' +
+    absentees.map(function (a) {
+      const uid = 'call_' + a.studentId;
+      return '<div class="card' + (a.color ? ' row-' + esc(a.color) : '') + '" data-student="' + a.studentId + '">' +
+        '<div class="flex-between" style="margin-bottom:10px">' +
+          '<div><strong>' + esc(a.name) + '</strong>' + (a.rollNo ? ' <span class="muted">(' + esc(a.rollNo) + ')</span>' : '') +
+            '<div class="muted" style="font-size:12.5px">Absent: ' + esc(a.subjects.join(', ')) + '</div></div>' +
+          '<div class="export-row">' +
+            (a.phone ? '<a class="btn btn-secondary btn-sm" href="tel:' + esc(a.phone) + '">Call student</a>' : '') +
+            (a.parentPhone ? '<a class="btn btn-secondary btn-sm" href="tel:' + esc(a.parentPhone) + '">Call parent</a>' : '') +
+          '</div>' +
+        '</div>' +
+        '<div class="field"><label>Remark (short)</label><input id="' + uid + '_remark" value="' + esc(a.remark) + '" placeholder="e.g. Spoke to mother, informed a day in advance"></div>' +
+        '<div class="field"><label>Reason (detail)</label><textarea id="' + uid + '_reason" rows="2" placeholder="Longer note if needed">' + esc(a.reason) + '</textarea></div>' +
+        '<div class="flex-between">' +
+          '<div class="color-swatch-row">' +
+            colors.map(function (c) {
+              const selected = (a.color || '') === c.key ? ' selected' : '';
+              return '<button type="button" class="color-swatch swatch-' + (c.key || 'none') + selected + '" data-color="' + c.key + '" onclick="pickSwatch(this)" title="' + c.label + '"></button>';
+            }).join('') +
+          '</div>' +
+          '<button class="btn btn-primary btn-sm" onclick="saveAbsenteeCall(this,\'' + a.studentId + '\',\'' + uid + '\')">Save</button>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+
+  area.querySelectorAll('[data-student]').forEach(function (card) { card.setAttribute('data-batch', batchId); card.setAttribute('data-date', date); });
+}
+
+function saveAbsenteeCall(btn, studentId, uid) {
+  const card = btn.closest('[data-student]');
+  const batchId = card.getAttribute('data-batch');
+  const date = card.getAttribute('data-date');
+  const selectedSwatch = card.querySelector('.color-swatch.selected');
+  const data = {
+    remark: document.getElementById(uid + '_remark').value.trim(),
+    reason: document.getElementById(uid + '_reason').value.trim(),
+    color: selectedSwatch ? selectedSwatch.getAttribute('data-color') : ''
+  };
+  const task = gs('saveAbsenteeCall', state.user.role, studentId, batchId, date, data).then(function () {
+    clearAttendanceCaches();
+    card.classList.remove('row-red', 'row-yellow', 'row-green', 'row-blue', 'row-purple');
+    if (data.color) card.classList.add('row-' + data.color);
+    toast('Saved', 'success');
+  }).catch(function (e) { toast(e.message || String(e), 'error'); });
+  runWithLoading(btn, 'Saving…', function () { return task; });
 }
 
 function exportCurrent(format) {
@@ -557,13 +603,16 @@ function renderReports() {
   content.innerHTML =
     '<div class="card">' +
       '<div class="filters">' +
-        '<div class="field"><label>Report type</label><select id="repType" onchange="loadReport()">' +
+        '<div class="field"><label>Report type</label><select id="repType" onchange="toggleReportFilters(); loadReport();">' +
           '<option value="student">Student-wise %</option>' +
           '<option value="batch">Batch/session-wise</option>' +
           '<option value="defaulters">Defaulters (below ' + state.defaulterThreshold + '%)</option>' +
+          '<option value="card">Student Report Card</option>' +
         '</select></div>' +
-        '<div class="field"><label>Batch</label><select id="repBatch" onchange="loadReport()"><option value="">All</option>' +
+        '<div class="field" id="repBatchWrap"><label>Batch</label><select id="repBatch" onchange="loadReport()"><option value="">All</option>' +
           batches.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') + '</select></div>' +
+        '<div class="field" id="repStudentWrap" style="display:none"><label>Student</label><select id="repStudent" onchange="loadReport()">' +
+          state.students.map(function (s) { return '<option value="' + s.ID + '">' + esc(s.Name) + (s.RollNo ? ' (' + esc(s.RollNo) + ')' : '') + '</option>'; }).join('') + '</select></div>' +
         '<div class="field"><label>From</label><input type="date" id="repFrom" onchange="loadReport()"></div>' +
         '<div class="field"><label>To</label><input type="date" id="repTo" onchange="loadReport()"></div>' +
       '</div>' +
@@ -579,6 +628,12 @@ function renderReports() {
   loadReport();
 }
 
+function toggleReportFilters() {
+  const isCard = document.getElementById('repType').value === 'card';
+  document.getElementById('repBatchWrap').style.display = isCard ? 'none' : '';
+  document.getElementById('repStudentWrap').style.display = isCard ? '' : 'none';
+}
+
 function loadReport() {
   const type = document.getElementById('repType').value;
   const filters = {
@@ -586,6 +641,19 @@ function loadReport() {
     from: document.getElementById('repFrom').value,
     to: document.getElementById('repTo').value
   };
+
+  if (type === 'card') {
+    const studentId = document.getElementById('repStudent').value;
+    if (!studentId) { document.getElementById('repTable').innerHTML = '<div class="empty-state">No students yet — add one from Students first.</div>'; return; }
+    const cacheKey = 'report:card:' + studentId + ':' + JSON.stringify(filters);
+    if (!getCache(cacheKey)) document.getElementById('repTable').innerHTML = '<div class="empty-state">Loading…</div>';
+    gsSWR(cacheKey, 'getStudentReportCard', [studentId, filters], function (data) {
+      if (state.view !== 'reports') return;
+      renderReportCard(data);
+    });
+    return;
+  }
+
   const fn = type === 'student' ? 'getStudentWiseReport' : type === 'batch' ? 'getBatchWiseReport' : 'getDefaultersReport';
   const cacheKey = 'report:' + type + ':' + JSON.stringify(filters);
   if (!getCache(cacheKey)) document.getElementById('repTable').innerHTML = '<div class="empty-state">Loading…</div>';
@@ -605,6 +673,33 @@ function loadReport() {
     lastExportData = { title: 'Report_' + type, headers: headers, rows: rows };
     document.getElementById('repTable').innerHTML = data.length ? renderTable(headers, displayRows) : '<div class="empty-state">No data for this filter.</div>';
   });
+}
+
+/** The full per-student report card: profile line, summary stats, and every record. */
+function renderReportCard(data) {
+  document.getElementById('repCount').textContent = data.records.length + ' record(s)';
+  if (!data.student) { document.getElementById('repTable').innerHTML = '<div class="empty-state">Student not found.</div>'; return; }
+  const s = data.student, sum = data.summary;
+
+  const headers = ['Date', 'Batch', 'Subject', 'Status', 'Remark', 'Reason'];
+  const rows = data.records.map(function (r) { return [fmtDate(r.date), r.batchName, r.subjectName, r.status, r.remark, r.reason]; });
+  lastExportData = { title: 'Report_Card_' + s.name.replace(/\s+/g, '_'), headers: headers, rows: rows };
+
+  document.getElementById('repTable').innerHTML =
+    '<div class="card" style="margin-bottom:16px">' +
+      '<h3 style="margin-top:0">' + esc(s.name) + (s.rollNo ? ' <span class="muted">(' + esc(s.rollNo) + ')</span>' : '') + '</h3>' +
+      '<p class="muted" style="margin:0 0 14px">' + esc(s.batchName) +
+        (s.phone ? ' &middot; ' + esc(s.phone) : '') + (s.parentPhone ? ' &middot; Parent: ' + esc(s.parentPhone) : '') + '</p>' +
+      '<div class="stat-grid">' +
+        statCard(sum.total, 'Sessions') + statCard(sum.present, 'Present') + statCard(sum.absent, 'Absent') +
+        '<div class="stat-card"><div class="num">' + badgePct(sum.percentage) + '</div><div class="label">Attendance</div></div>' +
+      '</div>' +
+    '</div>' +
+    (data.records.length
+      ? renderTable(headers, data.records.map(function (r) {
+          return [fmtDate(r.date), esc(r.batchName), esc(r.subjectName), statusBadge(r.status), r.remark ? esc(r.remark) : '<span class="muted">—</span>', r.reason ? esc(r.reason) : '<span class="muted">—</span>'];
+        }))
+      : '<div class="empty-state">No attendance records in this range yet.</div>');
 }
 
 /* ================= BATCHES (admin) ================= */
