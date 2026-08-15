@@ -536,9 +536,10 @@ function renderAbsenteeList(absentees, batchId, date) {
         '<div class="flex-between" style="margin-bottom:10px">' +
           '<div><strong>' + esc(a.name) + '</strong>' + (a.rollNo ? ' <span class="muted">(' + esc(a.rollNo) + ')</span>' : '') +
             '<div class="muted" style="font-size:12.5px">Absent: ' + esc(a.subjects.join(', ')) + '</div></div>' +
-          '<div class="export-row">' +
-            (a.phone ? '<a class="btn btn-secondary btn-sm" href="tel:' + esc(a.phone) + '">Call student</a>' : '') +
-            (a.parentPhone ? '<a class="btn btn-secondary btn-sm" href="tel:' + esc(a.parentPhone) + '">Call parent</a>' : '') +
+          '<div style="text-align:right;font-size:13.5px">' +
+            (a.phone ? '<div><strong>Student:</strong> ' + esc(a.phone) + '</div>' : '') +
+            (a.parentPhone ? '<div><strong>Parent:</strong> ' + esc(a.parentPhone) + '</div>' : '') +
+            (!a.phone && !a.parentPhone ? '<span class="muted">No number on file</span>' : '') +
           '</div>' +
         '</div>' +
         '<div class="field"><label>Remark (short)</label><input id="' + uid + '_remark" value="' + esc(a.remark) + '" placeholder="e.g. Spoke to mother, informed a day in advance"></div>' +
