@@ -1,11 +1,7 @@
 /* ==============================================================
-   CLIENT APP — talks to the Apps Script backend via gs() below,
-   which POSTs { fn, args } to your deployed Apps Script Web App URL.
+   CLIENT APP — talks to the database via gs() below, which is
+   defined in db.js (Supabase-backed) and loaded before this file.
 ================================================================= */
-
-// 1. Deploy the backend-apps-script project as a Web App (Execute as: Me, Who has access: Anyone)
-// 2. Paste that deployment URL (ends in /exec) below, between the quotes.
-const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwMHYucealGRS3rHaMCqIUBSNjdOSLpA2SrIb1JnSeSXL0G9BbKBmVp1Zmy4YyJCSt7/exec';
 
 const state = {
   user: null,
@@ -13,21 +9,6 @@ const state = {
   instituteName: 'Attendance Manager', defaulterThreshold: 75,
   view: 'home'
 };
-
-/** GETs SCRIPT_URL?fn=...&args=... and returns a promise.
- *  Uses GET, not POST: Apps Script's /exec URL responds with a redirect, and
- *  browsers silently downgrade POST to GET (dropping the body) when following
- *  it — that's why login kept "doing nothing". GET survives the redirect fine. */
-function gs(fnName) {
-  const args = Array.prototype.slice.call(arguments, 1);
-  const url = SCRIPT_URL + '?fn=' + encodeURIComponent(fnName) + '&args=' + encodeURIComponent(JSON.stringify(args));
-  return fetch(url)
-    .then(function (resp) { return resp.json(); })
-    .then(function (json) {
-      if (!json.ok) throw new Error(json.error || 'Server error');
-      return json.result;
-    });
-}
 
 /* ================= CACHE (stale-while-revalidate) =================
    Every gsSWR call shows cached data instantly (if any), then quietly
