@@ -24,29 +24,47 @@ function assertBatchAccess_(user, batchId) {
 function throwIfError_(error) { if (error) throw new Error(error.message || String(error)); }
 function uid_() { return crypto.randomUUID(); }
 
-/** Same tiny CSV-line parser as the old backend — handles "quoted, fields". */
-function parseCsvLine_(line) {
-  const out = [];
-  let cur = '', inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
+/** Real CSV parser over the WHOLE text (not line by line), so a quoted cell that
+ *  contains a line-break — e.g. two phone numbers on separate lines, or a
+ *  multi-line Reason — stays one cell instead of splitting the row in two.
+ *  Returns an array of rows, each an array of trimmed cell strings. */
+function parseCsv_(text) {
+  text = String(text || '').replace(/^\uFEFF/, '');
+  const rows = [];
+  let row = [], cur = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
     if (inQuotes) {
-      if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
-      else if (c === '"') { inQuotes = false; }
-      else { cur += c; }
-    } else {
-      if (c === '"') inQuotes = true;
-      else if (c === ',') { out.push(cur.trim()); cur = ''; }
-      else cur += c;
-    }
+      if (c === '"') {
+        if (text[i + 1] === '"') { cur += '"'; i++; }
+        else inQuotes = false;
+      } else cur += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(cur.trim()); cur = '';
+    } else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(cur.trim()); cur = '';
+      if (row.some(function (x) { return x !== ''; })) rows.push(row);
+      row = [];
+    } else cur += c;
   }
-  out.push(cur.trim());
-  return out;
+  row.push(cur.trim());
+  if (row.some(function (x) { return x !== ''; })) rows.push(row);
+  return rows;
 }
+
+/** Accepts dd/mm/yyyy, d-m-yy, dd.mm.yy etc. (two-digit years mean 20yy) and
+ *  returns yyyy-mm-dd — or null if it isn't a real calendar date. */
 function parseDmyDate_(s) {
-  const m = String(s || '').trim().match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+  const m = String(s || '').trim().match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2}|\d{4})$/);
   if (!m) return null;
-  return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+  const d = Number(m[1]), mo = Number(m[2]);
+  const y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+  const check = new Date(Date.UTC(y, mo - 1, d));
+  if (check.getUTCFullYear() !== y || check.getUTCMonth() !== mo - 1 || check.getUTCDate() !== d) return null;
+  return y + '-' + String(mo).padStart(2, '0') + '-' + String(d).padStart(2, '0');
 }
 function normalizeStatus_(v) {
   v = String(v || '').trim().toLowerCase();
@@ -55,6 +73,53 @@ function normalizeStatus_(v) {
   if (['absent', 'a', '0', 'no', 'n'].indexOf(v) !== -1) return 'Absent';
   if (['late', 'l'].indexOf(v) !== -1) return 'Late';
   return null;
+}
+/** Cells like "Sunday", "Holiday", "Week Off", "No Class" mean no class was held —
+ *  expected, not an error, so they're skipped quietly instead of being reported. */
+function isNoClassMarker_(v) {
+  return /^(sunday|holiday|week\s*off|no\s*class|off|teacher'?s\s*day)$/i.test(String(v || '').trim());
+}
+/** Phone cells sometimes hold two numbers on separate lines — keep both, on one line. */
+function cleanPhone_(s) {
+  return String(s || '').replace(/\s*[\r\n;]+\s*/g, ', ').trim();
+}
+
+/** Supabase returns at most 1000 rows per request, silently. This pages through
+ *  until everything is fetched. makeQuery must build a fresh query each call. */
+async function fetchAll_(makeQuery, pageSize) {
+  pageSize = pageSize || 1000;
+  const all = [];
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await makeQuery().range(from, from + pageSize - 1);
+    throwIfError_(error);
+    for (let i = 0; i < data.length; i++) all.push(data[i]);
+    if (data.length < pageSize) break;
+  }
+  return all;
+}
+
+/** Inserts a big array in chunks (a single request with tens of thousands of rows
+ *  would be rejected), a few chunks at a time. onProgress(doneRows) is optional. */
+async function insertChunked_(table, rows, opts) {
+  opts = opts || {};
+  const size = opts.size || 1000, parallel = opts.parallel || 3;
+  let next = 0, done = 0;
+  async function worker() {
+    while (next < rows.length) {
+      const start = next; next += size;
+      const chunk = rows.slice(start, start + size);
+      const q = opts.ignoreDuplicates
+        ? sb.from(table).upsert(chunk, { onConflict: opts.onConflict, ignoreDuplicates: true })
+        : sb.from(table).insert(chunk);
+      const { error } = await q;
+      throwIfError_(error);
+      done += chunk.length;
+      if (opts.onProgress) opts.onProgress(done);
+    }
+  }
+  const workers = [];
+  for (let i = 0; i < parallel; i++) workers.push(worker());
+  await Promise.all(workers);
 }
 
 /* -------- row → the same shape script.js already expects -------- */
@@ -66,6 +131,59 @@ function rowToStudent_(r) {
     Phone: r.phone || '', Email: r.email || '', ParentPhone: r.parent_phone || '',
     AdmissionDate: r.admission_date || '', Active: r.active
   };
+}
+
+const RECORD_COLUMNS_ = 'id, date, status, marked_by, remark, reason, color, batches(name), subjects(name), students(name, roll_no, phone, parent_phone)';
+function buildRecordsQuery_(filters, withCount) {
+  let q = sb.from('attendance').select(RECORD_COLUMNS_, withCount ? { count: 'exact' } : undefined);
+  if (filters.batchId) q = q.eq('batch_id', filters.batchId);
+  else if (filters.batchIds && filters.batchIds.length) q = q.in('batch_id', filters.batchIds);
+  if (filters.subjectId) q = q.eq('subject_id', filters.subjectId);
+  if (filters.studentId) q = q.eq('student_id', filters.studentId);
+  if (filters.from) q = q.gte('date', filters.from);
+  if (filters.to) q = q.lte('date', filters.to);
+  return q;
+}
+function rowToRecord_(r) {
+  return {
+    id: r.id, date: r.date,
+    batchName: r.batches ? r.batches.name : '(deleted batch)',
+    subjectName: r.subjects ? r.subjects.name : '(deleted subject)',
+    studentName: r.students ? r.students.name : '(deleted student)',
+    rollNo: r.students ? (r.students.roll_no || '') : '',
+    studentPhone: r.students ? (r.students.phone || '') : '',
+    parentPhone: r.students ? (r.students.parent_phone || '') : '',
+    status: r.status, markedBy: r.marked_by || '', remark: r.remark || '', reason: r.reason || '', color: r.color || ''
+  };
+}
+
+function studentWiseFromRecords_(records) {
+  const byStudent = {};
+  records.forEach(function (r) {
+    const key = r.studentName + '||' + r.rollNo;
+    if (!byStudent[key]) byStudent[key] = { studentName: r.studentName, rollNo: r.rollNo, total: 0, present: 0 };
+    byStudent[key].total++;
+    if (r.status === 'Present' || r.status === 'Late') byStudent[key].present++;
+  });
+  return Object.keys(byStudent).map(function (k) {
+    const s = byStudent[k];
+    return {
+      studentName: s.studentName, rollNo: s.rollNo, totalSessions: s.total, present: s.present,
+      absent: s.total - s.present, percentage: s.total ? Math.round((s.present / s.total) * 1000) / 10 : 0
+    };
+  }).sort(function (a, b) { return a.percentage - b.percentage; });
+}
+function batchWiseFromRecords_(records) {
+  const byKey = {};
+  records.forEach(function (r) {
+    const key = r.date + '||' + r.batchName + '||' + r.subjectName;
+    if (!byKey[key]) byKey[key] = { date: r.date, batchName: r.batchName, subjectName: r.subjectName, present: 0, absent: 0, late: 0, total: 0 };
+    byKey[key].total++;
+    if (r.status === 'Present') byKey[key].present++;
+    else if (r.status === 'Absent') byKey[key].absent++;
+    else if (r.status === 'Late') byKey[key].late++;
+  });
+  return Object.keys(byKey).map(function (k) { return byKey[k]; }).sort(function (a, b) { return a.date < b.date ? 1 : -1; });
 }
 
 const API = {
@@ -148,8 +266,7 @@ const API = {
   /* ---------------- SUBJECTS ---------------- */
 
   listSubjects: async function () {
-    const { data, error } = await sb.from('subjects').select('*').eq('active', true).order('name');
-    throwIfError_(error);
+    const data = await fetchAll_(function () { return sb.from('subjects').select('*').eq('active', true).order('name').order('id'); });
     return data.map(rowToSubject_);
   },
   createSubject: async function (role, data) {
@@ -179,8 +296,7 @@ const API = {
   /* ---------------- STUDENTS ---------------- */
 
   listStudents: async function () {
-    const { data, error } = await sb.from('students').select('*').eq('active', true).order('name');
-    throwIfError_(error);
+    const data = await fetchAll_(function () { return sb.from('students').select('*').eq('active', true).order('name').order('id'); });
     return data.map(rowToStudent_);
   },
   createStudent: async function (role, data) {
@@ -217,20 +333,19 @@ const API = {
   },
   bulkImportStudents: async function (role, batchId, csvText) {
     requireAdmin_(role);
-    let lines = csvText.split(/\r?\n/).map(function (l) { return l.trim(); }).filter(String);
-    if (lines.length && /^name\b/i.test((lines[0].split(',')[0] || '').replace(/^"|"$/g, '').trim())) lines = lines.slice(1);
+    let rows = parseCsv_(csvText);
+    if (rows.length && /^name$/i.test((rows[0][0] || '').trim())) rows = rows.slice(1);
 
-    const rows = lines.map(function (line) {
-      const parts = parseCsvLine_(line);
+    const today = new Date().toISOString().slice(0, 10);
+    const records = rows.map(function (parts) {
       return {
         id: uid_(), name: parts[0] || '', roll_no: parts[1] || '', batch_id: batchId,
-        phone: parts[2] || '', email: parts[3] || '',
-        admission_date: new Date().toISOString().slice(0, 10)
+        phone: cleanPhone_(parts[2]), email: parts[3] || '', admission_date: today
       };
     }).filter(function (r) { return r.name; });
 
-    if (rows.length) { const { error } = await sb.from('students').insert(rows); throwIfError_(error); }
-    return { success: true, count: rows.length };
+    if (records.length) await insertChunked_('students', records);
+    return { success: true, count: records.length };
   },
 
   /* ---------------- BOOTSTRAP + SETTINGS ---------------- */
@@ -297,26 +412,18 @@ const API = {
 
   getAttendanceRecords: async function (filters) {
     filters = filters || {};
-    let q = sb.from('attendance').select('id, date, status, marked_by, remark, reason, color, batches(name), subjects(name), students(name, roll_no, phone, parent_phone)');
-    if (filters.batchId) q = q.eq('batch_id', filters.batchId);
-    if (filters.subjectId) q = q.eq('subject_id', filters.subjectId);
-    if (filters.studentId) q = q.eq('student_id', filters.studentId);
-    if (filters.from) q = q.gte('date', filters.from);
-    if (filters.to) q = q.lte('date', filters.to);
-    const { data, error } = await q.order('date', { ascending: false });
+    const data = await fetchAll_(function () { return buildRecordsQuery_(filters, false).order('date', { ascending: false }).order('id'); });
+    return data.map(rowToRecord_);
+  },
+
+  /** For the Records screen: just the newest `limit` rows plus the true total —
+   *  so opening it with no filters doesn't try to pull tens of thousands of rows. */
+  getAttendanceRecordsPage: async function (filters, limit) {
+    filters = filters || {};
+    const { data, error, count } = await buildRecordsQuery_(filters, true)
+      .order('date', { ascending: false }).order('id').limit(limit || 500);
     throwIfError_(error);
-    return data.map(function (r) {
-      return {
-        id: r.id, date: r.date,
-        batchName: r.batches ? r.batches.name : '(deleted batch)',
-        subjectName: r.subjects ? r.subjects.name : '(deleted subject)',
-        studentName: r.students ? r.students.name : '(deleted student)',
-        rollNo: r.students ? (r.students.roll_no || '') : '',
-        studentPhone: r.students ? (r.students.phone || '') : '',
-        parentPhone: r.students ? (r.students.parent_phone || '') : '',
-        status: r.status, markedBy: r.marked_by || '', remark: r.remark || '', reason: r.reason || '', color: r.color || ''
-      };
-    });
+    return { records: data.map(rowToRecord_), total: count == null ? data.length : count };
   },
 
   updateAttendanceRecord: async function (role, id, data) {
@@ -372,35 +479,23 @@ const API = {
   /* ---------------- REPORTS ---------------- */
 
   getStudentWiseReport: async function (filters) {
-    const records = await API.getAttendanceRecords(filters || {});
-    const byStudent = {};
-    records.forEach(function (r) {
-      const key = r.studentName + '||' + r.rollNo;
-      if (!byStudent[key]) byStudent[key] = { studentName: r.studentName, rollNo: r.rollNo, total: 0, present: 0 };
-      byStudent[key].total++;
-      if (r.status === 'Present' || r.status === 'Late') byStudent[key].present++;
+    filters = filters || {};
+    // Computed inside the database (one fast query) — pulling every attendance row
+    // into the browser to count them doesn't scale past a few thousand rows.
+    const { data, error } = await sb.rpc('rpc_student_wise_report', {
+      p_batch_id: filters.batchId || null, p_from: filters.from || null, p_to: filters.to || null
     });
-    return Object.keys(byStudent).map(function (k) {
-      const s = byStudent[k];
-      return {
-        studentName: s.studentName, rollNo: s.rollNo, totalSessions: s.total, present: s.present,
-        absent: s.total - s.present, percentage: s.total ? Math.round((s.present / s.total) * 1000) / 10 : 0
-      };
-    }).sort(function (a, b) { return a.percentage - b.percentage; });
+    if (!error) return data;
+    return studentWiseFromRecords_(await API.getAttendanceRecords(filters)); // fallback if schema.sql wasn't re-run yet
   },
 
   getBatchWiseReport: async function (filters) {
-    const records = await API.getAttendanceRecords(filters || {});
-    const byKey = {};
-    records.forEach(function (r) {
-      const key = r.date + '||' + r.batchName + '||' + r.subjectName;
-      if (!byKey[key]) byKey[key] = { date: r.date, batchName: r.batchName, subjectName: r.subjectName, present: 0, absent: 0, late: 0, total: 0 };
-      byKey[key].total++;
-      if (r.status === 'Present') byKey[key].present++;
-      else if (r.status === 'Absent') byKey[key].absent++;
-      else if (r.status === 'Late') byKey[key].late++;
+    filters = filters || {};
+    const { data, error } = await sb.rpc('rpc_batch_wise_report', {
+      p_batch_id: filters.batchId || null, p_from: filters.from || null, p_to: filters.to || null
     });
-    return Object.keys(byKey).map(function (k) { return byKey[k]; }).sort(function (a, b) { return a.date < b.date ? 1 : -1; });
+    if (!error) return data;
+    return batchWiseFromRecords_(await API.getAttendanceRecords(filters));
   },
 
   getDefaultersReport: async function (filters) {
@@ -430,64 +525,103 @@ const API = {
 
   bulkImportAttendance: async function (role, csvText) {
     requireAdmin_(role);
-    let lines = String(csvText || '').split(/\r?\n/).filter(function (l) { return l.trim() !== ''; });
-    if (lines.length && /^name\b/i.test(parseCsvLine_(lines[0])[0] || '')) lines = lines.slice(1);
+    const progress = function (msg) { if (typeof importProgress === 'function') importProgress(msg); };
 
-    const [{ data: batchRows }, { data: subjectRows }, { data: studentRows }] = await Promise.all([
-      sb.from('batches').select('id, name'), sb.from('subjects').select('id, name, batch_id'), sb.from('students').select('id, name, roll_no, batch_id')
+    progress('Reading file…');
+    let rows = parseCsv_(csvText);
+    let rowOffset = 1; // CSV row number of rows[0] (row 1 = first line of the file)
+    if (rows.length && /^name$/i.test((rows[0][0] || '').trim())) { rows = rows.slice(1); rowOffset = 2; }
+
+    progress('Checking what already exists…');
+    const [batchRows, subjectRows, studentRows] = await Promise.all([
+      fetchAll_(function () { return sb.from('batches').select('id, name').order('id'); }),
+      fetchAll_(function () { return sb.from('subjects').select('id, name, batch_id').order('id'); }),
+      fetchAll_(function () { return sb.from('students').select('id, name, roll_no, batch_id').order('id'); })
     ]);
 
     const batchByName = {};
-    (batchRows || []).forEach(function (b) { batchByName[String(b.name).trim().toLowerCase()] = { ID: b.id, Name: b.name }; });
+    batchRows.forEach(function (b) { batchByName[String(b.name).trim().toLowerCase()] = { ID: b.id }; });
     const subjectByKey = {};
-    (subjectRows || []).forEach(function (s) { subjectByKey[s.batch_id + '||' + String(s.name).trim().toLowerCase()] = { ID: s.id }; });
-    const studentByRollKey = {}, studentByNameKey = {};
-    (studentRows || []).forEach(function (s) {
-      if (s.roll_no) studentByRollKey[s.batch_id + '||' + String(s.roll_no).trim().toLowerCase()] = { ID: s.id };
-      studentByNameKey[s.batch_id + '||' + String(s.name).trim().toLowerCase()] = { ID: s.id };
+    subjectRows.forEach(function (s) { subjectByKey[s.batch_id + '||' + String(s.name).trim().toLowerCase()] = { ID: s.id }; });
+    // A student is matched by roll number within the batch when a roll number is given;
+    // only when the roll number is blank do we fall back to matching on name.
+    const studentByRoll = {}, studentByName = {};
+    studentRows.forEach(function (s) {
+      const rec = { ID: s.id, name: s.name, roll: s.roll_no || '', row: null };
+      if (s.roll_no) studentByRoll[s.batch_id + '||' + String(s.roll_no).trim().toLowerCase()] = rec;
+      studentByName[s.batch_id + '||' + String(s.name).trim().toLowerCase()] = rec;
     });
 
     const CLASS_SLOTS = ['1st Class', '2nd Class', '3rd Class'];
+    const today = new Date().toISOString().slice(0, 10);
     const newBatches = [], newSubjects = [], newStudents = [], newAttendance = [];
-    let attendanceRows = 0, skippedRows = 0;
+    const seenSlots = {};                 // student|subject|date — catches duplicate rows inside the file
+    const unknown = {};                   // unrecognised text found in a class column → count
+    const invalidDates = { count: 0, samples: [] };
+    const nameMismatch = { count: 0, samples: [] };
+    let noClassRows = 0, missingFieldRows = 0, duplicateRows = 0;
 
-    lines.forEach(function (line) {
-      const cols = parseCsvLine_(line);
+    rows.forEach(function (cols, idx) {
+      const rowNo = idx + rowOffset;
       const name = (cols[0] || '').trim();
       const rollNo = (cols[1] || '').trim();
-      const parentPhone = (cols[2] || '').trim();
-      const studentPhone = (cols[3] || '').trim();
+      const parentPhone = cleanPhone_(cols[2]);
+      const studentPhone = cleanPhone_(cols[3]);
       const batchName = (cols[4] || '').trim();
-      const isoDate = parseDmyDate_(cols[5]);
-      const slotStatuses = [cols[6], cols[7], cols[8]];
+      const slotValues = [cols[6], cols[7], cols[8]];
       const remark = (cols[9] || '').trim();
       const reason = (cols[10] || '').trim();
 
-      if (!name || !batchName || !isoDate) { skippedRows++; return; }
+      if (!name || !batchName) { missingFieldRows++; return; }
+      const isoDate = parseDmyDate_(cols[5]);
+      if (!isoDate) {
+        invalidDates.count++;
+        if (invalidDates.samples.length < 5) invalidDates.samples.push({ row: rowNo, value: cols[5] || '(blank)' });
+        return;
+      }
 
       const batchKey = batchName.toLowerCase();
       let batch = batchByName[batchKey];
       if (!batch) {
-        batch = { ID: uid_(), Name: batchName };
+        batch = { ID: uid_() };
         batchByName[batchKey] = batch;
         newBatches.push({ id: batch.ID, name: batchName, description: 'Auto-created during bulk attendance import' });
       }
 
       const nameKey = batch.ID + '||' + name.toLowerCase();
       const rollKey = rollNo ? batch.ID + '||' + rollNo.toLowerCase() : null;
-      let student = (rollKey && studentByRollKey[rollKey]) || studentByNameKey[nameKey];
+      let student = rollKey ? studentByRoll[rollKey] : studentByName[nameKey];
+      if (!student && rollKey) {
+        const sameName = studentByName[nameKey];
+        if (sameName && !sameName.roll) student = sameName;   // an existing student that just had no roll number yet
+      }
+      if (student && rollKey && student.name.trim().toLowerCase() !== name.toLowerCase()) {
+        nameMismatch.count++;
+        if (nameMismatch.samples.length < 5) nameMismatch.samples.push({ roll: rollNo, kept: student.name, alsoSeen: name });
+      }
       if (!student) {
-        student = { ID: uid_() };
-        if (rollKey) studentByRollKey[rollKey] = student;
-        studentByNameKey[nameKey] = student;
-        newStudents.push({ id: student.ID, name: name, roll_no: rollNo, batch_id: batch.ID, phone: studentPhone, parent_phone: parentPhone, admission_date: new Date().toISOString().slice(0, 10) });
+        const dbRow = { id: uid_(), name: name, roll_no: rollNo, batch_id: batch.ID, phone: studentPhone, parent_phone: parentPhone, admission_date: today };
+        student = { ID: dbRow.id, name: name, roll: rollNo, row: dbRow };
+        if (rollKey) studentByRoll[rollKey] = student;
+        studentByName[nameKey] = student;
+        newStudents.push(dbRow);
+      } else if (student.row) {
+        // same new student seen again — fill in a phone number if the first row didn't have one
+        if (!student.row.phone && studentPhone) student.row.phone = studentPhone;
+        if (!student.row.parent_phone && parentPhone) student.row.parent_phone = parentPhone;
       }
 
-      let matchedAny = false;
+      let gotAny = false;
       CLASS_SLOTS.forEach(function (slotName, i) {
-        const status = normalizeStatus_(slotStatuses[i]);
-        if (!status) return;
-        matchedAny = true;
+        const raw = String(slotValues[i] || '').trim();
+        const status = normalizeStatus_(raw);
+        if (!status) {
+          if (raw && !isNoClassMarker_(raw)) {
+            if (unknown[raw] || Object.keys(unknown).length < 60) unknown[raw] = (unknown[raw] || 0) + 1;
+          }
+          return;
+        }
+        gotAny = true;
         const subjKey = batch.ID + '||' + slotName.toLowerCase();
         let subject = subjectByKey[subjKey];
         if (!subject) {
@@ -495,20 +629,52 @@ const API = {
           subjectByKey[subjKey] = subject;
           newSubjects.push({ id: subject.ID, name: slotName, batch_id: batch.ID });
         }
+        const slotKey = student.ID + '|' + subject.ID + '|' + isoDate;
+        if (seenSlots[slotKey]) { duplicateRows++; return; }
+        seenSlots[slotKey] = true;
         newAttendance.push({ id: uid_(), date: isoDate, batch_id: batch.ID, subject_id: subject.ID, student_id: student.ID, status: status, marked_by: 'Bulk Import', remark: remark, reason: reason });
-        attendanceRows++;
       });
-      if (!matchedAny) skippedRows++;
+      if (!gotAny) noClassRows++;
     });
 
-    if (newBatches.length) { const { error } = await sb.from('batches').insert(newBatches); throwIfError_(error); }
-    if (newSubjects.length) { const { error } = await sb.from('subjects').insert(newSubjects); throwIfError_(error); }
-    if (newStudents.length) { const { error } = await sb.from('students').insert(newStudents); throwIfError_(error); }
-    if (newAttendance.length) { const { error } = await sb.from('attendance').insert(newAttendance); throwIfError_(error); }
+    if (newBatches.length || newSubjects.length || newStudents.length) {
+      progress('Creating ' + newBatches.length + ' batch(es), ' + newSubjects.length + ' class slot(s), ' + newStudents.length + ' student(s)…');
+      if (newBatches.length) await insertChunked_('batches', newBatches);
+      if (newSubjects.length) await insertChunked_('subjects', newSubjects);
+      if (newStudents.length) await insertChunked_('students', newStudents);
+    }
+
+    let inserted = 0;
+    if (newAttendance.length) {
+      const countAttendance = async function () {
+        const { count, error } = await sb.from('attendance').select('id', { count: 'exact', head: true });
+        throwIfError_(error);
+        return count || 0;
+      };
+      const before = await countAttendance();
+      try {
+        await insertChunked_('attendance', newAttendance, {
+          size: 1000, parallel: 3, ignoreDuplicates: true, onConflict: 'student_id,subject_id,date',
+          onProgress: function (n) { progress('Saving attendance… ' + n.toLocaleString() + ' of ' + newAttendance.length.toLocaleString()); }
+        });
+      } catch (e) {
+        if (/ON CONFLICT/i.test(e.message)) {
+          throw new Error('The database needs its latest setup first — open Supabase → SQL Editor, run the newest schema.sql, then try the import again (nothing was lost; it is safe to retry).');
+        }
+        throw e;
+      }
+      inserted = (await countAttendance()) - before;
+    }
+
+    const unrecognized = Object.keys(unknown).map(function (k) { return { value: k, count: unknown[k] }; })
+      .sort(function (a, b) { return b.count - a.count; }).slice(0, 15);
 
     return {
-      success: true, attendanceRows: attendanceRows, newBatches: newBatches.length,
-      newSubjects: newSubjects.length, newStudents: newStudents.length, skippedRows: skippedRows
+      success: true, totalRows: rows.length,
+      attendanceRows: newAttendance.length, inserted: inserted, alreadyThere: newAttendance.length - inserted,
+      newBatches: newBatches.length, newSubjects: newSubjects.length, newStudents: newStudents.length,
+      noClassRows: noClassRows, duplicateRows: duplicateRows, missingFieldRows: missingFieldRows,
+      invalidDates: invalidDates, nameMismatch: nameMismatch, unrecognized: unrecognized
     };
   },
 
