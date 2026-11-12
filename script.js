@@ -418,7 +418,11 @@ function renderRecords() {
   loadRecords();
 }
 
-let lastExportData = null; // { title, headers, rows }
+let lastExportData = null; // { title, headers, rows, loadAll? } — loadAll fetches every matching row for export
+
+const RECORDS_PAGE_SIZE = 500;
+const RECORD_EXPORT_HEADERS = ['Date', 'Batch', 'Subject', 'Student', 'Roll No', 'Status', 'Marked By', 'Remark', 'Reason'];
+function recordToExportRow(r) { return [fmtDate(r.date), r.batchName, r.subjectName, r.studentName, r.rollNo, r.status, r.markedBy, r.remark, r.reason]; }
 
 function loadRecords() {
   const filters = {
@@ -427,18 +431,23 @@ function loadRecords() {
     from: document.getElementById('recFrom').value,
     to: document.getElementById('recTo').value
   };
+  // Teachers only ever see their own batches, even with "All" selected.
+  if (state.user.role !== 'Admin' && !filters.batchId) filters.batchIds = myBatches().map(function (b) { return b.ID; });
+
   const cacheKey = 'records:' + JSON.stringify(filters);
   if (!getCache(cacheKey)) document.getElementById('recTable').innerHTML = '<div class="empty-state">Loading…</div>';
-  gsSWR(cacheKey, 'getAttendanceRecords', [filters], function (records) {
+  gsSWR(cacheKey, 'getAttendanceRecordsPage', [filters, RECORDS_PAGE_SIZE], function (res) {
     if (state.view !== 'records') return;
-    if (state.user.role !== 'Admin') {
-      const allowedBatchNames = myBatches().map(function (b) { return b.Name; });
-      records = records.filter(function (r) { return allowedBatchNames.indexOf(r.batchName) !== -1; });
-    }
-    document.getElementById('recCount').textContent = records.length + ' record(s)';
-    const headers = ['Date', 'Batch', 'Subject', 'Student', 'Roll No', 'Status', 'Marked By', 'Remark', 'Reason'];
-    const rows = records.map(function (r) { return [fmtDate(r.date), r.batchName, r.subjectName, r.studentName, r.rollNo, r.status, r.markedBy, r.remark, r.reason]; });
-    lastExportData = { title: 'Attendance_Records', headers: headers, rows: rows };
+    const records = res.records, total = res.total;
+    document.getElementById('recCount').textContent = total.toLocaleString() + ' record(s)' +
+      (total > records.length ? ' — showing the latest ' + records.length.toLocaleString() + '. Narrow the filters to see others; Export includes all ' + total.toLocaleString() + '.' : '');
+    lastExportData = {
+      title: 'Attendance_Records', headers: RECORD_EXPORT_HEADERS,
+      rows: records.map(recordToExportRow),
+      loadAll: total > records.length
+        ? function () { return gs('getAttendanceRecords', filters).then(function (all) { return all.map(recordToExportRow); }); }
+        : null
+    };
     document.getElementById('recTable').innerHTML = records.length ? renderRecordsTable(records) : '<div class="empty-state">No records match these filters.</div>';
   });
 }
@@ -560,21 +569,37 @@ function saveAbsenteeCall(btn, studentId, uid) {
 }
 
 function exportCurrent(format) {
-  if (!lastExportData || !lastExportData.rows.length) { toast('Nothing to export yet', 'error'); return; }
-  toast('Preparing ' + format.toUpperCase() + '…');
-  gs('exportTable', format, lastExportData.title, lastExportData.headers, lastExportData.rows).then(function (res) {
-    if (res.error) { toast(res.error, 'error'); return; }
-    downloadBase64(res.base64, res.mimeType, res.filename);
+  if (!lastExportData) { toast('Nothing to export yet', 'error'); return; }
+  const data = lastExportData;
+  toast(data.loadAll ? 'Collecting all rows…' : 'Preparing ' + format.toUpperCase() + '…');
+  const rowsPromise = data.loadAll ? data.loadAll() : Promise.resolve(data.rows);
+  rowsPromise.then(function (rows) {
+    if (!rows.length) { toast('Nothing to export yet', 'error'); return; }
+    if (format === 'pdf' && rows.length > 5000) {
+      toast('PDF is limited to 5,000 rows (' + rows.length.toLocaleString() + ' here) — narrow the filters, or use CSV / Excel for everything.', 'error');
+      return;
+    }
+    if (data.loadAll) toast('Preparing ' + format.toUpperCase() + ' (' + rows.length.toLocaleString() + ' rows)…');
+    return gs('exportTable', format, data.title, data.headers, rows).then(function (res) {
+      if (res.error) { toast(res.error, 'error'); return; }
+      downloadBase64(res.base64, res.mimeType, res.filename);
+    });
   }).catch(function (e) { toast(e.message || String(e), 'error'); });
 }
 
 function downloadBase64(base64, mimeType, filename) {
+  // A Blob instead of a data: URL — browsers refuse data: URLs past ~2 MB, which a big export easily exceeds.
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const url = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
   const link = document.createElement('a');
-  link.href = 'data:' + mimeType + ';base64,' + base64;
+  link.href = url;
   link.download = filename;
   document.body.appendChild(link);
   link.click();
   link.remove();
+  setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
 }
 
 /* ================= REPORTS ================= */
@@ -653,6 +678,11 @@ function loadReport() {
       displayRows = data.map(function (r) { return [r.studentName, r.rollNo, r.totalSessions, r.present, r.absent, badgePct(r.percentage)]; });
     }
     lastExportData = { title: 'Report_' + type, headers: headers, rows: rows };
+    const REPORT_DISPLAY_CAP = 1000; // the table is only for reading — Export always has every row
+    if (data.length > REPORT_DISPLAY_CAP) {
+      document.getElementById('repCount').textContent = data.length.toLocaleString() + ' row(s) — showing the first ' + REPORT_DISPLAY_CAP.toLocaleString() + '. Narrow the filters, or Export for all.';
+      displayRows = displayRows.slice(0, REPORT_DISPLAY_CAP);
+    }
     document.getElementById('repTable').innerHTML = data.length ? renderTable(headers, displayRows) : '<div class="empty-state">No data for this filter.</div>';
   });
 }
@@ -867,30 +897,41 @@ function downloadSampleCsv() {
 
 /* ================= BULK ATTENDANCE IMPORT (admin, historical backfill) ================= */
 
+let pendingAttendanceCsv = ''; // a chosen file's text is kept here (not dumped into the textarea — files can be megabytes)
+
+function importProgress(msg) {
+  const el = document.getElementById('biaPreview');
+  if (el) el.textContent = msg;
+}
+
 function openBulkImportAttendance() {
+  pendingAttendanceCsv = '';
   showModal('bulkAttModal', 'Bulk import attendance history',
-    '<p class="muted" style="margin-top:0">For importing months of past records at once. Batches, students, and the three class slots below are created automatically if they don\'t already exist — no need to set anything up first.</p>' +
+    '<p class="muted" style="margin-top:0">For importing months of past records at once. Batches, students, and the three class slots are created automatically if they don\'t already exist — no need to set anything up first.</p>' +
     '<div class="field">' +
       '<label>Upload a CSV file</label>' +
       '<input type="file" id="biaFile" accept=".csv,text/csv" onchange="handleAttendanceCsvFileSelect(this)">' +
       '<div style="margin-top:6px"><a class="link" onclick="downloadSampleAttendanceCsv()">Download sample CSV</a></div>' +
     '</div>' +
-    '<div class="field"><label>...or paste CSV rows directly</label>' +
-      '<textarea id="biaText" rows="6" placeholder="Riya Sharma,101,9876500001,9876543210,IIT JEE Excel-1,15/06/2026,Present,Absent,Present,,"></textarea></div>' +
-    '<div id="biaPreview" class="muted" style="font-size:12.5px"></div>' +
-    '<p class="muted" style="font-size:12px">Columns, in order: Name, Roll Number, Parent Mobile, Student Mobile, Batch, Date (dd/mm/yyyy), 1st Class, 2nd Class, 3rd Class, Remark, Reason. Leave a class column blank if that session didn\'t happen. Don\'t re-upload the same file twice — it will duplicate those rows.</p>',
+    '<div class="field"><label>...or paste a few CSV rows directly</label>' +
+      '<textarea id="biaText" rows="4" placeholder="Riya Sharma,101,9876500001,9876543210,IIT JEE Excel-1,15/06/2026,Present,Absent,Present,,"></textarea></div>' +
+    '<div id="biaPreview" class="muted" style="font-size:12.5px;min-height:18px"></div>' +
+    '<p class="muted" style="font-size:12px">Columns, in order: Name, Roll Number, Parent Mobile, Student Mobile, Batch, Date (15/06/2026 or 15-6-26 both work), 1st Class, 2nd Class, 3rd Class, Remark, Reason. Students are matched by roll number within a batch (by name only if the roll number is blank). A blank class cell, or Sunday / Holiday / Week Off / No Class, means no class that day — nothing is recorded for it. Re-uploading the same file is safe: rows already in the database are skipped.</p>',
     function () {
-      const text = document.getElementById('biaText').value.trim();
+      const text = (document.getElementById('biaText').value.trim()) || pendingAttendanceCsv;
       if (!text) { toast('Upload a CSV or paste rows first', 'error'); return; }
+      importProgress('Starting…');
       return gs('bulkImportAttendance', state.user.role, text).then(function (res) {
         closeModal();
+        pendingAttendanceCsv = '';
         clearAttendanceCaches();
         return refreshData().then(function () {
           renderRecords();
-          toast(res.attendanceRows + ' attendance record(s) imported' +
-            (res.newBatches || res.newStudents || res.newSubjects ? ' (' + res.newBatches + ' new batch(es), ' + res.newStudents + ' new student(s))' : '') +
-            (res.skippedRows ? ' — ' + res.skippedRows + ' row(s) skipped' : ''), 'success');
+          showImportSummary(res);
         });
+      }).catch(function (e) {
+        importProgress('');
+        toast(e.message || String(e), 'error');
       });
     });
 }
@@ -900,13 +941,53 @@ function handleAttendanceCsvFileSelect(input) {
   if (!file) return;
   const reader = new FileReader();
   reader.onload = function (e) {
-    const text = String(e.target.result || '').trim();
-    document.getElementById('biaText').value = text;
-    const rowCount = text.split(/\r?\n/).filter(function (l) { return l.trim(); }).length;
-    document.getElementById('biaPreview').textContent = file.name + ' loaded — ' + rowCount + ' row(s) ready to import.';
+    pendingAttendanceCsv = String(e.target.result || '');
+    document.getElementById('biaText').value = '';
+    importProgress(file.name + ' loaded (' + (file.size / 1048576).toFixed(1) + ' MB) — press Save to import it.');
   };
   reader.onerror = function () { toast('Could not read that file', 'error'); };
   reader.readAsText(file);
+}
+
+/** What happened, in plain terms — including anything that was set aside and why. */
+function showImportSummary(r) {
+  const n = function (x) { return Number(x || 0).toLocaleString(); };
+  let html =
+    '<p style="margin-top:0"><strong>' + n(r.inserted) + '</strong> attendance record(s) added' +
+    (r.alreadyThere ? ' <span class="muted">(' + n(r.alreadyThere) + ' were already in the database)</span>' : '') + '.</p>' +
+    '<ul style="padding-left:18px;line-height:1.6">';
+  if (r.newBatches || r.newStudents || r.newSubjects) {
+    html += '<li>Created ' + n(r.newBatches) + ' batch(es), ' + n(r.newStudents) + ' student(s), ' + n(r.newSubjects) + ' class slot(s).</li>';
+  }
+  if (r.noClassRows) html += '<li>' + n(r.noClassRows) + ' row(s) had no Present/Absent in any class (blank, Sunday, holiday…) — nothing to record.</li>';
+  if (r.duplicateRows) html += '<li>' + n(r.duplicateRows) + ' duplicate entr' + (r.duplicateRows === 1 ? 'y' : 'ies') + ' for the same student, class and day — the first one was kept.</li>';
+  if (r.missingFieldRows) html += '<li>' + n(r.missingFieldRows) + ' row(s) skipped: name or batch missing.</li>';
+  if (r.invalidDates && r.invalidDates.count) {
+    html += '<li><strong>' + n(r.invalidDates.count) + ' row(s) skipped — date not understood</strong>: ' +
+      r.invalidDates.samples.map(function (x) { return 'row ' + n(x.row) + ' ("' + esc(x.value) + '")'; }).join(', ') +
+      (r.invalidDates.count > r.invalidDates.samples.length ? ' …' : '') + '</li>';
+  }
+  if (r.nameMismatch && r.nameMismatch.count) {
+    html += '<li>' + n(r.nameMismatch.count) + ' row(s) had the same roll number as an existing student but a different spelling of the name — treated as the same student. e.g. ' +
+      r.nameMismatch.samples.slice(0, 3).map(function (x) { return esc(x.roll) + ': ' + esc(x.kept) + ' / ' + esc(x.alsoSeen); }).join('; ') + '</li>';
+  }
+  html += '</ul>';
+  if (r.unrecognized && r.unrecognized.length) {
+    html += '<p style="margin-bottom:4px"><strong>Not imported — these cells in a class column weren\'t Present/Absent:</strong></p>' +
+      '<p class="muted" style="margin-top:0;font-size:13px">' +
+      r.unrecognized.map(function (u) { return '“' + esc(u.value) + '” ×' + n(u.count); }).join(' &nbsp;·&nbsp; ') +
+      '<br>Looks like call notes typed into the wrong column. If they should count as Absent, change them to “Absent” in the file and import again (already-imported rows are skipped).</p>';
+  }
+  showInfoModal('Import finished', html);
+}
+
+function showInfoModal(title, bodyHtml) {
+  closeModal();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = '<div class="modal" style="width:560px"><h3>' + esc(title) + '</h3><div>' + bodyHtml + '</div>' +
+    '<div class="modal-actions"><button class="btn btn-primary" onclick="closeModal()">OK</button></div></div>';
+  document.body.appendChild(overlay);
 }
 
 function downloadSampleAttendanceCsv() {
