@@ -280,3 +280,34 @@
   .off-panel { background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; padding: 16px; margin-bottom: 8px; }
   .off-title { font-weight: 700; font-size: 15px; color: #92400e; }
   @media (max-width: 600px) { .quick-wrap { width: 100%; justify-content: space-between; } .quick-select { flex: 1; } }
+
+  /* ---------- Multi-select picker chips, contact numbers, activity log ---------- */
+  .field-wide { min-width: 280px; flex: 1 1 320px; }
+  .picker-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .picker-chips:empty { display: none; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--primary-light); color: var(--primary-dark); border-radius: 999px; padding: 4px 6px 4px 12px; font-size: 12.5px; }
+  .chip-x { border: none; background: rgba(79,70,229,0.15); color: var(--primary-dark); width: 20px; height: 20px; border-radius: 50%; cursor: pointer; line-height: 1; font-size: 15px; padding: 0; }
+  .picker-multi .picker-clear { top: auto; bottom: 4px; }
+  .picker-hint { margin-top: 6px; font-size: 12.5px; }
+  .picker-hint:empty { display: none; }
+  .chip-add { border: 1px dashed var(--primary); background: #fff; color: var(--primary-dark); border-radius: 999px; padding: 3px 10px; font-size: 12px; cursor: pointer; margin: 2px 4px 2px 0; }
+  .profile-list { background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; font-size: 13px; }
+  .profile-row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; flex-wrap: wrap; }
+
+  .contact-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+  .contact-no { width: 20px; color: var(--text-muted); font-size: 13px; flex-shrink: 0; }
+  .contact-row .c-label { width: 118px; flex-shrink: 0; }
+  .contact-row .c-number { flex: 1; min-width: 0; }
+  .icon-btn { width: 32px; height: 36px; border: 1px solid var(--border); background: #fff; border-radius: 8px; cursor: pointer; font-size: 15px; flex-shrink: 0; padding: 0; }
+  .icon-btn:hover { background: var(--primary-light); }
+  .icon-btn.danger { color: #dc2626; }
+  .contact-line { white-space: nowrap; font-size: 12.5px; }
+  .call-numbers { text-align: right; font-size: 13.5px; }
+  a.tel { color: var(--primary); text-decoration: none; font-weight: 600; }
+  @media (max-width: 600px) {
+    .contact-row { flex-wrap: wrap; }
+    .contact-row .c-number { flex: 1 1 100%; order: 5; margin-left: 26px; }
+    .call-numbers { text-align: left; }
+    .field-wide { min-width: 0; flex-basis: 100%; }
+  }
+  .check-row.perm-child { margin-left: 22px; }

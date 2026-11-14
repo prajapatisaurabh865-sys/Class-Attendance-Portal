@@ -6,7 +6,7 @@
 const state = {
   user: null,
   batches: [], closedBatches: [], subjects: [], students: [], discontinued: [],
-  instituteName: 'Attendance Manager', defaulterThreshold: 75,
+  instituteName: 'Unacademy Class Attendance', defaulterThreshold: 75,
   view: 'home'
 };
 
@@ -99,26 +99,30 @@ const PERMISSIONS = [
   { key: 'records', label: 'Records (view)' },
   { key: 'calling', label: 'Absentees Calling sheet' },
   { key: 'reports', label: 'Reports' },
-  { key: 'export', label: 'Export CSV / Excel / PDF' },
-  { key: 'students', label: 'Students (add, edit, discontinue, restore)' },
+  { key: 'students', label: 'Students page (view list)' },
+  { key: 'student_add', label: 'Add student', parent: 'students' },
+  { key: 'student_edit', label: 'Edit student', parent: 'students' },
+  { key: 'student_discontinue', label: 'Discontinue / Restore student', parent: 'students' },
+  { key: 'student_delete', label: 'Delete student', parent: 'students' },
   { key: 'batches', label: 'Batches (add, edit, close, restore)' },
   { key: 'subjects', label: 'Subjects (add, edit)' },
   { key: 'bulk_import', label: 'Bulk import (students & attendance history)' }
 ];
-const ROLES = ['Teacher', 'Tele Caller', 'Floor Incharge', 'Admin'];
-/** What gets pre-ticked when a role is picked while creating a login — the admin can still tick/untick anything. */
+/* Roles: Teacher and Admin are fixed. Anything else is a custom role name typed by the admin
+   (e.g. "Tele Caller") — the role name is just a label, what a login can do comes from its ticked access. */
+const ROLES = ['Teacher', 'Admin'];
+/** Pre-ticked access for a role while creating a login — the admin can still tick/untick anything. */
 const ROLE_PRESETS = {
   'Teacher': ['dashboard', 'mark', 'records', 'calling', 'reports'],
-  'Tele Caller': ['dashboard', 'calling', 'records'],
-  'Floor Incharge': ['dashboard', 'mark', 'records', 'calling', 'reports', 'export'],
   'Admin': PERMISSIONS.map(function (p) { return p.key; })
 };
+const CUSTOM_ROLE_DEFAULT = ['dashboard', 'records'];
 
 function normalizeUser(u) {
   const user = Object.assign({}, u);
   user.assignedBatchIds = user.assignedBatchIds || [];
   if (user.role === 'Admin') user.permissions = ROLE_PRESETS['Admin'].slice();
-  else if (!Array.isArray(user.permissions)) user.permissions = (ROLE_PRESETS[user.role] || ROLE_PRESETS['Teacher']).slice();
+  else if (!Array.isArray(user.permissions)) user.permissions = (ROLE_PRESETS[user.role] || CUSTOM_ROLE_DEFAULT).slice();
   return user;
 }
 function isAdmin() { return !!state.user && state.user.role === 'Admin'; }
@@ -256,8 +260,9 @@ const NAV = [
   { id: 'batches', label: 'Batches', perm: 'batches' },
   { id: 'subjects', label: 'Subjects', perm: 'subjects' },
   { id: 'students', label: 'Students', perm: 'students' },
-  { id: 'discontinued', label: 'Discontinued Students', perm: 'students' },
+  { id: 'discontinued', label: 'Discontinued Students', perm: 'student_discontinue' },
   { id: 'teachers', label: 'Staff Logins', perm: '__admin' },
+  { id: 'activity', label: 'Activity Log', perm: '__admin' },
   { id: 'settings', label: 'Settings', perm: '__admin' }
 ];
 function canSeeNav(n) { return n.perm === '__admin' ? isAdmin() : hasPerm(n.perm); }
@@ -273,7 +278,7 @@ function renderShell() {
   document.getElementById('app').innerHTML =
     '<div class="menu-backdrop" id="menuBackdrop" onclick="closeMenu()"></div>' +
     '<aside class="sidebar" id="sidebar">' +
-      '<div class="sidebar-head"><div class="brand">' + esc(state.instituteName) + '<small>Attendance Manager</small></div>' +
+      '<div class="sidebar-head"><div class="brand">' + esc(state.instituteName) + '</div>' +
         '<button type="button" class="menu-close" onclick="closeMenu()" aria-label="Close menu">&times;</button></div>' +
       '<nav class="nav-list">' + navHtml + '</nav>' +
       '<div class="sidebar-footer"><div class="who">' + esc(state.user.name) + ' &middot; ' + esc(state.user.role) + '</div>' +
@@ -312,12 +317,12 @@ function setView(v) {
 
 function renderView() {
   const titles = { home: 'Dashboard', mark: 'Mark Attendance', records: 'Attendance Records', calling: 'Absentees Calling Sheet', reports: 'Reports',
-    batches: 'Batches', subjects: 'Subjects', students: 'Students', discontinued: 'Discontinued Students', teachers: 'Staff Logins', settings: 'Settings' };
+    batches: 'Batches', subjects: 'Subjects', students: 'Students', discontinued: 'Discontinued Students', teachers: 'Staff Logins', activity: 'Activity Log', settings: 'Settings' };
   if (!canSeeNavId(state.view)) state.view = firstAllowedView();
   document.getElementById('viewTitle').textContent = titles[state.view] || '';
   if (!NAV.some(canSeeNav)) { document.getElementById('content').innerHTML = '<div class="empty-state">No access has been given to this login yet. Ask your admin.</div>'; return; }
   const renderers = { home: renderHome, mark: renderMark, records: renderRecords, calling: renderCalling, reports: renderReports,
-    batches: renderBatches, subjects: renderSubjects, students: renderStudents, discontinued: renderDiscontinued, teachers: renderTeachers, settings: renderSettings };
+    batches: renderBatches, subjects: renderSubjects, students: renderStudents, discontinued: renderDiscontinued, teachers: renderTeachers, activity: renderActivity, settings: renderSettings };
   (renderers[state.view] || renderHome)();
 }
 
@@ -350,17 +355,26 @@ function renderHome() {
 }
 
 /* ================= STUDENT SEARCH PICKER =================
-   Replaces the long <select> dropdowns. Type the first letters of a name (or roll no)
-   and matching students appear straight away — names starting with what you typed come first. */
+   Type the first letters of a name (or roll no / phone) and matching students appear straight away —
+   names starting with what you typed come first. With opts.multi you can pick several students
+   (e.g. the same person who moved between batches) and they show as removable chips. */
 
 function byId(id) { return document.getElementById(id); }
 
-function studentPickerHtml(id, placeholder) {
-  return '<div class="picker" id="' + id + 'Wrap">' +
+const PICKERS = {};
+
+function studentPickerHtml(id, placeholder, multi) {
+  return '<div class="picker' + (multi ? ' picker-multi' : '') + '" id="' + id + 'Wrap">' +
+    (multi ? '<div class="picker-chips" id="' + id + 'Chips"></div>' : '') +
     '<input type="text" id="' + id + 'Input" class="picker-input" placeholder="' + esc(placeholder || 'Type student name…') + '" autocomplete="off" autocapitalize="off" spellcheck="false">' +
     '<button type="button" class="picker-clear" id="' + id + 'Clear" title="Clear" aria-label="Clear">&times;</button>' +
+    (multi ? '<div class="picker-hint" id="' + id + 'Hint"></div>' : '') +
     '<input type="hidden" id="' + id + '" value="">' +
     '<div class="picker-list" id="' + id + 'List"></div></div>';
+}
+
+function contactNums_(s) {
+  return (s.Contacts || []).map(function (c) { return c.number; }).concat([s.Phone, s.ParentPhone]).join(' ');
 }
 
 function searchStudents_(pool, q) {
@@ -375,23 +389,27 @@ function searchStudents_(pool, q) {
     else if (name.split(' ').some(function (w) { return w.indexOf(q) === 0; })) score = 1;
     else if (roll.indexOf(q) === 0) score = 2;
     else if (name.indexOf(q) !== -1) score = 3;
-    else if (roll.indexOf(q) !== -1 || String(s.Phone || '').indexOf(q) !== -1 || String(s.ParentPhone || '').indexOf(q) !== -1) score = 4;
+    else if (roll.indexOf(q) !== -1 || contactNums_(s).indexOf(q) !== -1) score = 4;
     if (score >= 0) out.push({ s: s, score: score, name: name });
   });
   out.sort(function (a, b) { return a.score - b.score || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0); });
   return out.slice(0, 40).map(function (x) { return x.s; });
 }
 
-/** opts.getStudents() → array of students to search; opts.onChange(studentId or '') fires on pick / clear. */
+/** opts.getStudents() → students to search; opts.onChange(id) (single) or opts.onChange([ids]) (multi). */
 function initStudentPicker(id, opts) {
+  const multi = !!opts.multi;
   const input = byId(id + 'Input'), hidden = byId(id), list = byId(id + 'List'), clearBtn = byId(id + 'Clear');
+  const chipsEl = byId(id + 'Chips'), hintEl = byId(id + 'Hint');
   if (!input) return;
-  let items = [], active = -1, label = '';
+  let items = [], active = -1, label = '', selected = [];
+  const labelOf = function (s) { return s.Name + (s.RollNo ? ' (' + s.RollNo + ')' : ''); };
+  const fire = function () { if (opts.onChange) opts.onChange(multi ? selected.map(function (s) { return s.ID; }) : hidden.value); };
 
   function close() { list.style.display = 'none'; active = -1; }
   function show() {
-    items = searchStudents_(opts.getStudents(), input.value);
     if (!input.value.trim()) { close(); return; }
+    items = searchStudents_(opts.getStudents(), input.value).filter(function (s) { return !selected.some(function (x) { return x.ID === s.ID; }); });
     list.innerHTML = items.length
       ? items.map(function (s, i) {
           return '<div class="picker-item" data-i="' + i + '"><span class="pi-name">' + esc(s.Name) + '</span>' +
@@ -407,61 +425,105 @@ function initStudentPicker(id, opts) {
       if (i === active) el.scrollIntoView({ block: 'nearest' });
     });
   }
+
+  /* ----- multi: chips + "same name in another batch" hint ----- */
+  function renderChips() {
+    chipsEl.innerHTML = selected.map(function (s) {
+      return '<span class="chip"><span><b>' + esc(s.Name) + '</b>' + (s.RollNo ? ' (' + esc(s.RollNo) + ')' : '') + ' · ' + esc(batchNameAny(s.BatchID)) + '</span>' +
+        '<button type="button" class="chip-x" data-remove="' + s.ID + '" aria-label="Remove">&times;</button></span>';
+    }).join('');
+    hidden.value = selected.map(function (s) { return s.ID; }).join(',');
+    clearBtn.style.display = selected.length ? 'block' : 'none';
+    // someone with the very same name in another batch is probably the same person
+    const names = selected.map(function (s) { return String(s.Name || '').trim().toLowerCase(); });
+    const twins = opts.getStudents().filter(function (s) {
+      return names.indexOf(String(s.Name || '').trim().toLowerCase()) !== -1 && !selected.some(function (x) { return x.ID === s.ID; });
+    });
+    hintEl.innerHTML = twins.length
+      ? '<span class="muted">Same name in another batch — add:</span> ' + twins.slice(0, 6).map(function (s) {
+          return '<button type="button" class="chip-add" data-add="' + s.ID + '">+ ' + esc(labelOf(s)) + ' · ' + esc(batchNameAny(s.BatchID)) + '</button>';
+        }).join(' ')
+      : '';
+  }
+  function addSelected(s) {
+    if (!s || selected.some(function (x) { return x.ID === s.ID; })) return;
+    selected.push(s);
+    renderChips();
+    fire();
+  }
+
   function choose(i) {
     const s = items[i];
     if (!s) return;
+    if (multi) { input.value = ''; close(); addSelected(s); return; }
     hidden.value = s.ID;
-    label = s.Name + (s.RollNo ? ' (' + s.RollNo + ')' : '');
+    label = labelOf(s);
     input.value = label;
     clearBtn.style.display = 'block';
     close();
-    if (opts.onChange) opts.onChange(s.ID);
+    fire();
   }
-  function clear(fire) {
-    const had = !!hidden.value;
-    hidden.value = ''; input.value = ''; label = '';
+  function clear(doFire) {
+    const had = multi ? selected.length > 0 : !!hidden.value;
+    selected = []; hidden.value = ''; input.value = ''; label = '';
+    if (multi) renderChips();
     clearBtn.style.display = 'none';
     close();
-    if (had && fire && opts.onChange) opts.onChange('');
+    if (had && doFire) fire();
   }
 
   input.addEventListener('input', function () {
-    if (hidden.value && input.value !== label) { hidden.value = ''; if (opts.onChange) opts.onChange(''); }
-    clearBtn.style.display = input.value ? 'block' : 'none';
+    if (!multi && hidden.value && input.value !== label) { hidden.value = ''; fire(); }
+    if (!multi) clearBtn.style.display = input.value ? 'block' : 'none';
     show();
   });
-  input.addEventListener('focus', function () { if (input.value && !hidden.value) show(); else input.select(); });
+  input.addEventListener('focus', function () { if (input.value && (multi || !hidden.value)) show(); else if (!multi) input.select(); });
   input.addEventListener('keydown', function (e) {
     if (e.key === 'ArrowDown') { e.preventDefault(); if (list.style.display !== 'block') show(); active = Math.min(active + 1, items.length - 1); highlight(); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(active - 1, 0); highlight(); }
     else if (e.key === 'Enter') { if (list.style.display === 'block') { e.preventDefault(); choose(active >= 0 ? active : 0); } }
     else if (e.key === 'Escape') { close(); }
+    else if (e.key === 'Backspace' && multi && !input.value && selected.length) { selected.pop(); renderChips(); fire(); }
   });
   input.addEventListener('blur', function () {
-    setTimeout(function () { close(); if (!hidden.value && input.value) { input.value = ''; clearBtn.style.display = 'none'; } }, 180);
+    setTimeout(function () {
+      close();
+      if (input.value && (multi || !hidden.value)) { input.value = ''; if (!multi) clearBtn.style.display = 'none'; }
+    }, 180);
   });
   list.addEventListener('mousedown', function (e) { e.preventDefault(); }); // keep focus so the click below lands
   list.addEventListener('click', function (e) {
     const el = e.target.closest('.picker-item');
     if (el) choose(Number(el.getAttribute('data-i')));
   });
+  if (multi) {
+    chipsEl.addEventListener('click', function (e) {
+      const b = e.target.closest('[data-remove]');
+      if (!b) return;
+      selected = selected.filter(function (s) { return s.ID !== b.getAttribute('data-remove'); });
+      renderChips(); fire();
+    });
+    hintEl.addEventListener('click', function (e) {
+      const b = e.target.closest('[data-add]');
+      if (!b) return;
+      addSelected(opts.getStudents().find(function (s) { return s.ID === b.getAttribute('data-add'); }));
+    });
+  }
   clearBtn.addEventListener('mousedown', function (e) { e.preventDefault(); });
   clearBtn.addEventListener('click', function () { clear(true); input.focus(); });
   clearBtn.style.display = 'none';
+
+  PICKERS[id] = {
+    clear: function () { clear(false); },
+    setSelected: function (students) {
+      if (multi) { selected = []; students.forEach(function (s) { selected.push(s); }); renderChips(); }
+      else if (students[0]) { hidden.value = students[0].ID; label = labelOf(students[0]); input.value = label; clearBtn.style.display = 'block'; }
+    }
+  };
 }
 
-function setStudentPicker(id, student) {
-  byId(id).value = student.ID;
-  byId(id + 'Input').value = student.Name + (student.RollNo ? ' (' + student.RollNo + ')' : '');
-  byId(id + 'Clear').style.display = 'block';
-  // let the "typed text differs from chosen label" check treat this as the chosen label
-  byId(id + 'Input').dispatchEvent(new Event('change'));
-}
-function clearStudentPicker(id) {
-  const input = byId(id + 'Input');
-  if (!input) return;
-  byId(id).value = ''; input.value = ''; byId(id + 'Clear').style.display = 'none';
-}
+function setStudentPicker(id, student) { if (PICKERS[id]) PICKERS[id].setSelected([student]); }
+function clearStudentPicker(id) { if (PICKERS[id]) PICKERS[id].clear(); }
 
 function statCard(num, label) {
   return '<div class="stat-card"><div class="num">' + esc(num) + '</div><div class="label">' + esc(label) + '</div></div>';
@@ -792,7 +854,7 @@ function renderRecords() {
 }
 
 function exportRowHtml() {
-  if (!hasPerm('export')) return '';
+  if (!isAdmin()) return ''; // exports are for the admin only
   return '<div class="export-row">' +
     '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'csv\')">Export CSV</button>' +
     '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'xlsx\')">Export Excel</button>' +
@@ -920,10 +982,12 @@ function renderAbsenteeList(res, batchId, date) {
         '<div class="flex-between" style="margin-bottom:10px">' +
           '<div><strong>' + esc(a.name) + '</strong>' + (a.rollNo ? ' <span class="muted">(' + esc(a.rollNo) + ')</span>' : '') +
             '<div class="muted" style="font-size:12.5px">Absent: ' + esc(a.subjects.join(', ')) + '</div></div>' +
-          '<div style="text-align:right;font-size:13.5px">' +
-            (a.phone ? '<div><strong>Student:</strong> ' + esc(a.phone) + '</div>' : '') +
-            (a.parentPhone ? '<div><strong>Parent:</strong> ' + esc(a.parentPhone) + '</div>' : '') +
-            (!a.phone && !a.parentPhone ? '<span class="muted">No number on file</span>' : '') +
+          '<div class="call-numbers">' +
+            (a.contacts && a.contacts.length
+              ? '<div class="muted" style="font-size:11.5px;margin-bottom:2px">Call in this order</div>' + a.contacts.map(function (c, i) {
+                  return '<div><strong>' + (i + 1) + '. ' + esc(c.label) + ':</strong> <a class="tel" href="tel:' + esc(c.number) + '">' + esc(c.number) + '</a></div>';
+                }).join('')
+              : '<span class="muted">No number on file</span>') +
           '</div>' +
         '</div>' +
         '<div class="field"><label>Remark (short)</label><input id="' + uid + '_remark" value="' + esc(a.remark) + '" placeholder="e.g. Spoke to mother, informed a day in advance"></div>' +
@@ -963,6 +1027,7 @@ function saveAbsenteeCall(btn, studentId, uid) {
 }
 
 function exportCurrent(format) {
+  if (!isAdmin()) { toast('Only the admin can export', 'error'); return; }
   if (!lastExportData) { toast('Nothing to export yet', 'error'); return; }
   const data = lastExportData;
   toast(data.loadAll ? 'Collecting all rows…' : 'Preparing ' + format.toUpperCase() + '…');
@@ -1005,14 +1070,14 @@ function renderReports() {
     '<div class="card">' +
       '<div class="filters">' +
         '<div class="field"><label>Report type</label><select id="repType" onchange="toggleReportFilters(); loadReport();">' +
+          '<option value="card">Student Report Card</option>' +
           '<option value="student">Student-wise %</option>' +
           '<option value="batch">Batch/session-wise</option>' +
           '<option value="defaulters">Defaulters (below ' + state.defaulterThreshold + '%)</option>' +
-          '<option value="card">Student Report Card</option>' +
         '</select></div>' +
-        '<div class="field" id="repBatchWrap"><label>Batch</label><select id="repBatch" onchange="loadReport()"><option value="">All</option>' +
+        '<div class="field" id="repBatchWrap" style="display:none"><label>Batch</label><select id="repBatch" onchange="loadReport()"><option value="">All</option>' +
           batches.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') + '</select></div>' +
-        '<div class="field" id="repStudentWrap" style="display:none"><label>Student</label>' + studentPickerHtml('repStudent', 'Type student name…') + '</div>' +
+        '<div class="field field-wide" id="repStudentWrap"><label>Student(s) — pick more than one to combine</label>' + studentPickerHtml('repStudent', 'Type student name…', true) + '</div>' +
         '<div class="field"><label>From</label><input type="date" id="repFrom" onchange="loadReport()"></div>' +
         '<div class="field"><label>To</label><input type="date" id="repTo" onchange="loadReport()"></div>' +
       '</div>' +
@@ -1021,7 +1086,7 @@ function renderReports() {
       '</div>' +
       '<div id="repTable" style="margin-top:12px"></div>' +
     '</div>';
-  initStudentPicker('repStudent', { getStudents: visibleStudents, onChange: function () { loadReport(); } });
+  initStudentPicker('repStudent', { multi: true, getStudents: visibleStudents, onChange: function () { loadReport(); } });
   if (pendingReportStudent) {
     const st = visibleStudents().find(function (x) { return x.ID === pendingReportStudent; });
     pendingReportStudent = null;
@@ -1045,15 +1110,16 @@ function loadReport() {
   };
 
   if (type === 'card') {
-    const studentId = document.getElementById('repStudent').value;
-    if (!studentId) {
+    const studentIds = (document.getElementById('repStudent').value || '').split(',').filter(Boolean);
+    if (!studentIds.length) {
       document.getElementById('repCount').textContent = '';
-      document.getElementById('repTable').innerHTML = '<div class="empty-state">Type a student\'s name above and pick them to see the report card.</div>';
+      document.getElementById('repTable').innerHTML = '<div class="empty-state">Type a student\'s name above and pick them to see the report card. Pick two or more profiles of the same student to see one combined report.</div>';
       return;
     }
-    const cacheKey = 'report:card:' + studentId + ':' + JSON.stringify(filters);
+    const cacheKey = 'report:card:' + studentIds.join('+') + ':' + JSON.stringify(filters);
     if (!getCache(cacheKey)) document.getElementById('repTable').innerHTML = '<div class="empty-state">Loading…</div>';
-    gsSWR(cacheKey, 'getStudentReportCard', [studentId, filters], function (data) {
+    gsSWR(cacheKey, 'getCombinedReportCard', [studentIds, filters], function (data) {
+      if ((document.getElementById('repStudent').value || '').split(',').filter(Boolean).join('+') !== studentIds.join('+')) return; // selection changed meanwhile
       if (state.view !== 'reports') return;
       renderReportCard(data);
     });
@@ -1094,13 +1160,20 @@ function renderReportCard(data) {
 
   const headers = ['Date', 'Batch', 'Subject', 'Status', 'Remark', 'Reason'];
   const rows = data.records.map(function (r) { return [fmtDate(r.date), r.batchName, r.subjectName, r.status, r.remark, r.reason]; });
-  lastExportData = { title: 'Report_Card_' + s.name.replace(/\s+/g, '_'), headers: headers, rows: rows };
+  lastExportData = { title: 'Report_Card_' + s.name.replace(/[\s\/]+/g, '_'), headers: headers, rows: rows };
 
   document.getElementById('repTable').innerHTML =
     '<div class="card" style="margin-bottom:16px">' +
       '<h3 style="margin-top:0">' + esc(s.name) + (s.rollNo ? ' <span class="muted">(' + esc(s.rollNo) + ')</span>' : '') + '</h3>' +
-      '<p class="muted" style="margin:0 0 14px">' + esc(s.batchName) +
-        (s.phone ? ' &middot; ' + esc(s.phone) : '') + (s.parentPhone ? ' &middot; Parent: ' + esc(s.parentPhone) : '') + '</p>' +
+      '<p class="muted" style="margin:0 0 ' + (data.profiles && data.profiles.length > 1 ? '8' : '14') + 'px">' + esc(s.batchName) +
+        ((s.contacts || []).length ? ' &middot; ' + s.contacts.map(function (c) { return esc(c.label) + ': ' + esc(c.number); }).join(' &middot; ') : '') + '</p>' +
+      (data.profiles && data.profiles.length > 1
+        ? '<div class="profile-list"><div class="muted" style="margin-bottom:4px">Combined report of ' + data.profiles.length + ' profiles:</div>' +
+          data.profiles.map(function (pf) {
+            return '<div class="profile-row"><span><b>' + esc(pf.name) + '</b>' + (pf.rollNo ? ' (' + esc(pf.rollNo) + ')' : '') + ' · ' + esc(pf.batchName) + '</span>' +
+              '<span class="muted">' + pf.summary.present + ' / ' + pf.summary.total + ' · ' + pf.summary.percentage + '%</span></div>';
+          }).join('') + '</div>'
+        : '') +
       '<div class="stat-grid">' +
         statCard(sum.total, 'Sessions') + statCard(sum.present, 'Present') + statCard(sum.absent, 'Absent') +
         '<div class="stat-card"><div class="num">' + badgePct(sum.percentage) + '</div><div class="label">Attendance</div></div>' +
@@ -1216,7 +1289,7 @@ function renderStudents() {
     '<div class="card">' +
       '<div class="card-header"><h3>Students</h3><div>' +
         (hasPerm('bulk_import') ? '<button class="btn btn-secondary btn-sm" onclick="openBulkImport()">Bulk import</button> ' : '') +
-        '<button class="btn btn-primary btn-sm" onclick="openStudentModal()">+ Add student</button></div></div>' +
+        (hasPerm('student_add') ? '<button class="btn btn-primary btn-sm" onclick="openStudentModal()">+ Add student</button>' : '') + '</div></div>' +
       '<div class="field" style="max-width:320px"><input type="text" id="studentSearch" placeholder="Search by name, roll no, or phone…" oninput="renderStudentsTable()"></div>' +
       '<div id="studentsTableArea"></div>' +
     '</div>';
@@ -1227,15 +1300,14 @@ function renderStudentsTable() {
   const filtered = !q ? state.students : state.students.filter(function (s) {
     return String(s.Name || '').toLowerCase().indexOf(q) !== -1 ||
       String(s.RollNo || '').toLowerCase().indexOf(q) !== -1 ||
-      String(s.Phone || '').toLowerCase().indexOf(q) !== -1 ||
-      String(s.ParentPhone || '').toLowerCase().indexOf(q) !== -1;
+      contactNums_(s).toLowerCase().indexOf(q) !== -1;
   });
   document.getElementById('studentsTableArea').innerHTML = filtered.length
-    ? renderTable(['Name', 'Roll No', 'Batch', 'Phone', 'Parent Phone', ''], filtered.map(function (s) {
-        return [esc(s.Name), esc(s.RollNo || ''), esc(batchNameAny(s.BatchID)), esc(s.Phone || ''), esc(s.ParentPhone || ''),
-          '<a class="link" onclick=\'openStudentModal(' + JSON.stringify(s.ID) + ')\'>Edit</a> &nbsp; ' +
-          '<a class="link" style="color:#d97706" onclick=\'openDiscontinueModal(' + JSON.stringify(s.ID) + ')\'>Discontinue</a> &nbsp; ' +
-          '<a class="link" style="color:#dc2626" onclick="deleteStudentConfirm(this,\'' + s.ID + '\')">Delete</a>'];
+    ? renderTable(['Name', 'Roll No', 'Batch', 'Contact numbers (call in this order)', ''], filtered.map(function (s) {
+        return [esc(s.Name), esc(s.RollNo || ''), esc(batchNameAny(s.BatchID)), contactsHtml(s.Contacts),
+          (hasPerm('student_edit') ? '<a class="link" onclick=\'openStudentModal(' + JSON.stringify(s.ID) + ')\'>Edit</a> &nbsp; ' : '') +
+          (hasPerm('student_discontinue') ? '<a class="link" style="color:#d97706" onclick=\'openDiscontinueModal(' + JSON.stringify(s.ID) + ')\'>Discontinue</a> &nbsp; ' : '') +
+          (hasPerm('student_delete') ? '<a class="link" style="color:#dc2626" onclick="deleteStudentConfirm(this,\'' + s.ID + '\')">Delete</a>' : '')];
       }))
     : '<div class="empty-state">No students match "' + esc(q) + '".</div>';
 }
@@ -1251,9 +1323,10 @@ function openStudentModal(id) {
     '<div class="field"><label>Batch</label><select id="stBatch">' +
       batchOpts.map(function (b) { return '<option value="' + b.ID + '"' + (student && student.BatchID === b.ID ? ' selected' : '') + '>' + esc(b.Name) + (b.Closed ? ' (Closed)' : '') + '</option>'; }).join('') +
     '</select></div>' +
-    '<div class="field-row">' +
-      '<div class="field"><label>Phone (student)</label><input id="stPhone" value="' + esc(student ? student.Phone : '') + '"></div>' +
-      '<div class="field"><label>Phone (parent)</label><input id="stParentPhone" value="' + esc(student ? student.ParentPhone : '') + '"></div>' +
+    '<div class="field"><label>Mobile numbers — in the order they should be called</label>' +
+      '<div id="contactList"></div>' +
+      '<button type="button" class="btn btn-secondary btn-sm" onclick="addContactRow()">+ Add another number</button>' +
+      '<div class="muted" style="font-size:12px;margin-top:6px">Use the ↑ ↓ buttons to set who is called first. If the first number is not answered, the next one is tried.</div>' +
     '</div>' +
     '<div class="field"><label>Email</label><input id="stEmail" value="' + esc(student ? student.Email : '') + '"></div>',
     function () {
@@ -1261,15 +1334,64 @@ function openStudentModal(id) {
         name: document.getElementById('stName').value.trim(),
         rollNo: document.getElementById('stRoll').value.trim(),
         batchId: document.getElementById('stBatch').value,
-        phone: document.getElementById('stPhone').value.trim(),
-        parentPhone: document.getElementById('stParentPhone').value.trim(),
         email: document.getElementById('stEmail').value.trim()
       };
       if (!data.name) { toast('Name is required', 'error'); return; }
+      const contacts = collectContacts();
+      if (contacts === null) return;
+      data.contacts = contacts;
       const call = student ? gs('updateStudent', state.user.role, Object.assign({ id: student.ID }, data)) : gs('createStudent', state.user.role, data);
       return call.then(function () { closeModal(); return refreshData(); }).then(function () { renderStudents(); toast('Saved', 'success'); })
         .catch(function (e) { toast(e.message || String(e), 'error'); });
     });
+  const start = student ? student.Contacts : [];
+  if (start.length) start.forEach(function (c) { addContactRow(c.label, c.number); });
+  else { addContactRow('Student', ''); addContactRow('Father', ''); }
+}
+
+/* ----- ordered contact numbers (student modal) ----- */
+const CONTACT_LABELS = ['Student', 'Father', 'Mother', 'Guardian', 'Brother', 'Sister', 'Uncle', 'Aunt', 'Grandparent', 'Other'];
+function contactsHtml(contacts) {
+  if (!contacts || !contacts.length) return '<span class="muted">—</span>';
+  return contacts.map(function (c, i) { return '<div class="contact-line">' + (i + 1) + '. <span class="muted">' + esc(c.label) + '</span> ' + esc(c.number) + '</div>'; }).join('');
+}
+function addContactRow(label, number) {
+  const list = byId('contactList');
+  const known = CONTACT_LABELS.indexOf(label) !== -1;
+  if (label && !known) label = 'Other'; // e.g. an older "Parent" entry
+  const row = document.createElement('div');
+  row.className = 'contact-row';
+  row.innerHTML = '<span class="contact-no"></span>' +
+    '<select class="c-label">' + CONTACT_LABELS.map(function (l) { return '<option' + (l === (label || 'Other') ? ' selected' : '') + '>' + l + '</option>'; }).join('') + '</select>' +
+    '<input class="c-number" type="tel" inputmode="tel" placeholder="Mobile number" value="' + esc(number || '') + '">' +
+    '<button type="button" class="icon-btn" onclick="moveContact(this,-1)" title="Call earlier">↑</button>' +
+    '<button type="button" class="icon-btn" onclick="moveContact(this,1)" title="Call later">↓</button>' +
+    '<button type="button" class="icon-btn danger" onclick="removeContact(this)" title="Remove">&times;</button>';
+  list.appendChild(row);
+  renumberContacts();
+}
+function renumberContacts() {
+  Array.prototype.forEach.call(document.querySelectorAll('#contactList .contact-row'), function (row, i) { row.querySelector('.contact-no').textContent = (i + 1) + '.'; });
+}
+function moveContact(btn, dir) {
+  const row = btn.closest('.contact-row'), list = row.parentNode;
+  if (dir < 0 && row.previousElementSibling) list.insertBefore(row, row.previousElementSibling);
+  else if (dir > 0 && row.nextElementSibling) list.insertBefore(row.nextElementSibling, row);
+  renumberContacts();
+}
+function removeContact(btn) { btn.closest('.contact-row').remove(); renumberContacts(); }
+/** Returns the cleaned ordered list, or null (after showing a message) if a number looks wrong. */
+function collectContacts() {
+  const out = [];
+  const rows = document.querySelectorAll('#contactList .contact-row');
+  for (let i = 0; i < rows.length; i++) {
+    const raw = rows[i].querySelector('.c-number').value.trim();
+    if (!raw) continue;
+    const num = raw.replace(/[\s-]/g, '');
+    if (!/^\+?[0-9]{7,15}$/.test(num)) { toast('Number ' + (i + 1) + ' (' + raw + ') does not look right', 'error'); return null; }
+    out.push({ label: rows[i].querySelector('.c-label').value, number: num });
+  }
+  return out;
 }
 function openDiscontinueModal(id) {
   const s = state.students.find(function (x) { return x.ID === id; });
@@ -1309,11 +1431,11 @@ function renderDiscontinuedTable() {
   const q = (document.getElementById('discSearch').value || '').trim().toLowerCase();
   const all = state.discontinued || [];
   const filtered = !q ? all : all.filter(function (s) {
-    return [s.Name, s.RollNo, s.Phone, s.ParentPhone].some(function (v) { return String(v || '').toLowerCase().indexOf(q) !== -1; });
+    return [s.Name, s.RollNo, contactNums_(s)].some(function (v) { return String(v || '').toLowerCase().indexOf(q) !== -1; });
   });
   document.getElementById('discTableArea').innerHTML = filtered.length
-    ? renderTable(['Name', 'Roll No', 'Batch', 'Phone', 'Parent Phone', 'Discontinued on', 'Reason', ''], filtered.map(function (s) {
-        return [esc(s.Name), esc(s.RollNo || ''), esc(batchNameAny(s.BatchID)), esc(s.Phone || ''), esc(s.ParentPhone || ''),
+    ? renderTable(['Name', 'Roll No', 'Batch', 'Contact numbers', 'Discontinued on', 'Reason', ''], filtered.map(function (s) {
+        return [esc(s.Name), esc(s.RollNo || ''), esc(batchNameAny(s.BatchID)), contactsHtml(s.Contacts),
           s.DiscontinuedAt ? fmtDate(s.DiscontinuedAt) : '—', s.DiscontinueReason ? esc(s.DiscontinueReason) : '<span class="muted">—</span>',
           (hasPerm('reports') ? '<a class="link" onclick="viewStudentCard(\'' + s.ID + '\')">Report card</a> &nbsp; ' : '') +
           '<a class="link" style="color:#16a34a" onclick="restoreStudentConfirm(this,\'' + s.ID + '\')">Restore</a>'];
@@ -1492,7 +1614,7 @@ function renderTeachers() {
         '<div class="card-header"><h3>Staff logins</h3><button class="btn btn-primary btn-sm" onclick="openUserModal()">+ Add login</button></div>' +
         renderTable(['Name', 'Username', 'Role', 'Access', 'Assigned batches', 'Status', ''], users.map(function (u) {
           const access = u.role === 'Admin' ? 'Full access'
-            : (u.permissions || []).map(function (k) { const p = PERMISSIONS.find(function (x) { return x.key === k; }); return p ? p.label.replace(/ \(.*\)/, '') : k; }).join(', ') || '—';
+            : (u.permissions || []).map(function (k) { const p = PERMISSIONS.find(function (x) { return x.key === k; }); return p ? p.label.replace(/ \(.*\)/, '') : ''; }).filter(Boolean).join(', ') || '—';
           return [esc(u.name), esc(u.username), esc(u.role), '<span style="font-size:12.5px">' + esc(access) + '</span>',
             u.role === 'Admin' ? '<span class="muted">All</span>' : esc(batchNames(u.assignedBatchIds)),
             u.active ? '<span class="badge badge-success">Active</span>' : '<span class="badge badge-neutral">Disabled</span>',
@@ -1506,19 +1628,24 @@ function renderTeachers() {
 function openUserModal(id) {
   gs('listUsers', state.user.role).then(function (users) {
     const u = id ? users.find(function (x) { return x.id === id; }) : null;
-    const startRole = u ? u.role : 'Teacher';
-    const startPerms = u ? (u.role === 'Admin' ? [] : (u.permissions || [])) : ROLE_PRESETS[startRole];
+    const isCustomRole = !!u && u.role !== 'Admin' && u.role !== 'Teacher';
+    const startRole = !u ? 'Teacher' : isCustomRole ? '__custom' : u.role;
+    const startPerms = u ? (u.role === 'Admin' ? [] : (u.permissions || [])) : ROLE_PRESETS['Teacher'];
     const batches = state.batches.concat(state.closedBatches || []);
     showModal('userModal', (u ? 'Edit' : 'Add') + ' login',
       '<div class="field"><label>Name</label><input id="uName" value="' + esc(u ? u.name : '') + '"></div>' +
       '<div class="field"><label>Username</label><input id="uUsername" autocapitalize="off" value="' + esc(u ? u.username : '') + '"' + (u ? ' disabled' : '') + '></div>' +
       '<div class="field"><label>' + (u ? 'New password (leave blank to keep current)' : 'Password') + '</label><input id="uPassword" type="password" autocomplete="new-password"></div>' +
       '<div class="field"><label>Role</label><select id="uRole" onchange="onUserRoleChange()">' +
-        ROLES.map(function (r) { return '<option value="' + r + '"' + (r === startRole ? ' selected' : '') + '>' + r + '</option>'; }).join('') +
+        '<option value="Teacher"' + (startRole === 'Teacher' ? ' selected' : '') + '>Teacher</option>' +
+        '<option value="__custom"' + (startRole === '__custom' ? ' selected' : '') + '>Custom role…</option>' +
+        '<option value="Admin"' + (startRole === 'Admin' ? ' selected' : '') + '>Admin</option>' +
       '</select></div>' +
+      '<div class="field" id="customRoleWrap" style="display:none"><label>Custom role name</label><input id="uRoleName" placeholder="e.g. Tele Caller, Floor Incharge, Coordinator" value="' + esc(isCustomRole ? u.role : '') + '"></div>' +
       '<div class="field" id="permWrap"><label>What can this login access? (tick / untick anything)</label>' +
         PERMISSIONS.map(function (p) {
-          return '<label class="check-row"><input type="checkbox" class="permCheck" value="' + p.key + '"' + (startPerms.indexOf(p.key) !== -1 ? ' checked' : '') + '> ' + esc(p.label) + '</label>';
+          return '<label class="check-row' + (p.parent ? ' perm-child' : '') + '"><input type="checkbox" class="permCheck" value="' + p.key + '"' + (p.parent ? ' data-parent="' + p.parent + '"' : '') +
+            ' onchange="onPermChange(this)"' + (startPerms.indexOf(p.key) !== -1 ? ' checked' : '') + '> ' + esc(p.label) + '</label>';
         }).join('') +
       '</div>' +
       '<div class="field" id="batchPickerWrap"><label>Batches this login can work with</label>' +
@@ -1531,7 +1658,12 @@ function openUserModal(id) {
       (u ? '<label class="check-row" style="margin-top:10px"><input type="checkbox" id="uActive"' + (u.active ? ' checked' : '') + '> Login enabled</label>' : ''),
       function () {
         const assignedBatchIds = Array.prototype.map.call(document.querySelectorAll('.batchCheck:checked'), function (c) { return c.value; });
-        const role = document.getElementById('uRole').value;
+        let role = document.getElementById('uRole').value;
+        if (role === '__custom') {
+          role = document.getElementById('uRoleName').value.trim();
+          if (!role) { toast('Type the custom role name', 'error'); return; }
+          if (role.toLowerCase() === 'admin') { toast('"Admin" is a fixed role — pick Admin from the list instead', 'error'); return; }
+        }
         const password = document.getElementById('uPassword').value;
         const permissions = role === 'Admin' ? ROLE_PRESETS['Admin'] : Array.prototype.map.call(document.querySelectorAll('.permCheck:checked'), function (c) { return c.value; });
         if (role !== 'Admin' && !permissions.length) { toast('Tick at least one thing this login can access', 'error'); return; }
@@ -1554,11 +1686,22 @@ function openUserModal(id) {
 /** Picking a role pre-ticks that role's usual access — the admin then adjusts it as needed. */
 function onUserRoleChange() {
   const role = document.getElementById('uRole').value;
-  const preset = ROLE_PRESETS[role] || [];
-  document.querySelectorAll('.permCheck').forEach(function (c) { c.checked = preset.indexOf(c.value) !== -1; });
+  if (role === 'Teacher') {
+    const preset = ROLE_PRESETS['Teacher'];
+    document.querySelectorAll('.permCheck').forEach(function (c) { c.checked = preset.indexOf(c.value) !== -1; });
+  }
   toggleUserSections();
 }
+/** Ticking "Edit student" etc. also ticks the Students page; unticking the page unticks its actions. */
+function onPermChange(el) {
+  if (el.checked && el.getAttribute('data-parent')) {
+    const par = document.querySelector('.permCheck[value="' + el.getAttribute('data-parent') + '"]');
+    if (par) par.checked = true;
+  }
+  if (!el.checked) document.querySelectorAll('.permCheck[data-parent="' + el.value + '"]').forEach(function (c) { c.checked = false; });
+}
 function toggleUserSections() {
+  document.getElementById('customRoleWrap').style.display = document.getElementById('uRole').value === '__custom' ? 'block' : 'none';
   const isAdminRole = document.getElementById('uRole').value === 'Admin';
   document.getElementById('permWrap').style.display = isAdminRole ? 'none' : 'block';
   document.getElementById('batchPickerWrap').style.display = isAdminRole ? 'none' : 'block';
@@ -1576,6 +1719,62 @@ function deleteUserConfirm(el, id) {
   });
 }
 
+
+/* ================= ACTIVITY LOG (admin) ================= */
+
+let activityPage = 0, activityToken = 0, activityTimer = null;
+const ACTIVITY_PAGE_SIZE = 50;
+
+function renderActivity() {
+  const content = document.getElementById('content');
+  activityPage = 0;
+  content.innerHTML =
+    '<div class="card">' +
+      '<div class="filters">' +
+        '<div class="field"><label>Login</label><select id="actUser" onchange="activityPage=0;loadActivity()"><option value="">All logins</option></select></div>' +
+        '<div class="field"><label>From</label><input type="date" id="actFrom" onchange="activityPage=0;loadActivity()"></div>' +
+        '<div class="field"><label>To</label><input type="date" id="actTo" onchange="activityPage=0;loadActivity()"></div>' +
+        '<div class="field"><label>Search (action or student / batch name)</label><input id="actSearch" placeholder="e.g. discontinued, Riya, JEE" oninput="activitySearchTyped()"></div>' +
+        '<div class="field"><button class="btn btn-secondary" onclick="loadActivity(this)">Reload</button></div>' +
+      '</div>' +
+      '<p class="muted" style="margin:0">Every change made through this app is recorded here with the login that made it. Entries cannot be edited or deleted from the app.</p>' +
+    '</div>' +
+    '<div class="card" id="activityArea"><div class="empty-state">Loading…</div></div>';
+  gs('listUsers', state.user.role).then(function (users) {
+    const sel = byId('actUser');
+    if (!sel) return;
+    users.forEach(function (u) { const o = document.createElement('option'); o.value = u.id; o.textContent = u.name + ' (' + u.role + ')'; sel.appendChild(o); });
+  }).catch(function () { });
+  loadActivity();
+}
+function activitySearchTyped() {
+  clearTimeout(activityTimer);
+  activityTimer = setTimeout(function () { activityPage = 0; loadActivity(); }, 350);
+}
+function fmtWhen(iso) {
+  const d = new Date(iso);
+  return d.toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true });
+}
+function loadActivity(btn) {
+  const token = ++activityToken;
+  const filters = { userId: byId('actUser').value, from: byId('actFrom').value, to: byId('actTo').value, search: byId('actSearch').value.trim(), page: activityPage, pageSize: ACTIVITY_PAGE_SIZE };
+  const task = gs('listActivity', filters).then(function (res) {
+    if (token !== activityToken || state.view !== 'activity') return;
+    const from = res.total ? activityPage * ACTIVITY_PAGE_SIZE + 1 : 0;
+    const to = activityPage * ACTIVITY_PAGE_SIZE + res.rows.length;
+    byId('activityArea').innerHTML =
+      '<div class="flex-between" style="margin-bottom:10px"><div class="muted">' + (res.total ? 'Showing ' + from + '–' + to + ' of ' + res.total.toLocaleString() : 'No activity found') + '</div>' +
+        '<div><button class="btn btn-secondary btn-sm" ' + (activityPage > 0 ? '' : 'disabled') + ' onclick="activityPage--;loadActivity()">← Newer</button> ' +
+        '<button class="btn btn-secondary btn-sm" ' + (to < res.total ? '' : 'disabled') + ' onclick="activityPage++;loadActivity()">Older →</button></div></div>' +
+      (res.rows.length ? renderTable(['When', 'Login', 'Role', 'Action', 'Details'], res.rows.map(function (r) {
+        return [esc(fmtWhen(r.created_at)), '<strong>' + esc(r.user_name) + '</strong>', esc(r.role), esc(r.action), '<span style="font-size:12.5px">' + esc(r.details) + '</span>'];
+      })) : '<div class="empty-state">Nothing recorded for these filters yet.</div>');
+  }).catch(function (e) {
+    if (token === activityToken && byId('activityArea')) byId('activityArea').innerHTML = '<div class="empty-state">Could not load the activity log. Run the latest schema.sql in Supabase first.</div>';
+    toast(e.message || String(e), 'error');
+  });
+  if (btn) runWithLoading(btn, 'Loading…', function () { return task; });
+}
 
 /* ================= SETTINGS (admin) ================= */
 

@@ -1,5 +1,5 @@
 -- ==================================================================
---  ATTENDANCE MANAGER — SUPABASE SCHEMA  (v2)
+--  ATTENDANCE MANAGER — SUPABASE SCHEMA  (v4)
 -- ==================================================================
 -- Run this in Supabase (safe to run again on an existing database —
 -- it only adds what is missing and keeps all your data): Dashboard → SQL Editor → New query →
@@ -118,6 +118,51 @@ alter table class_off enable row level security;
 drop policy if exists "public read/write class_off" on class_off;
 create policy "public read/write class_off" on class_off for all using (true) with check (true);
 
+-- v4: several phone numbers per student (in calling order), activity log, student-level permissions, custom roles
+alter table students add column if not exists contacts jsonb not null default '[]'::jsonb;
+
+do $$
+begin
+  if not exists (select 1 from config where key = 'mig_contacts') then
+    -- carry over the old single numbers: student phone first, then parent phone
+    update students set contacts =
+      (case when coalesce(phone, '') <> '' then jsonb_build_array(jsonb_build_object('label', 'Student', 'number', phone)) else '[]'::jsonb end)
+      || (case when coalesce(parent_phone, '') <> '' then jsonb_build_array(jsonb_build_object('label', 'Parent', 'number', parent_phone)) else '[]'::jsonb end)
+    where contacts = '[]'::jsonb;
+    insert into config (key, value) values ('mig_contacts', 'done');
+  end if;
+
+  if not exists (select 1 from config where key = 'mig_student_perms') then
+    -- logins that could use the Students page keep exactly what they could do before
+    update users set permissions = (select array(select distinct unnest(permissions || array['student_add', 'student_edit', 'student_discontinue', 'student_delete'])))
+      where 'students' = any(permissions);
+    insert into config (key, value) values ('mig_student_perms', 'done');
+  end if;
+end $$;
+
+-- Export is admin-only now, so the old 'export' permission is dropped from every login
+update users set permissions = array_remove(permissions, 'export') where 'export' = any(permissions);
+
+update config set value = 'Unacademy Class Attendance' where key = 'InstituteName' and value = 'My Coaching Institute';
+
+-- Who did what. The app can only ADD to this log and read it — never edit or delete entries.
+create table if not exists activity_log (
+  id uuid primary key default extensions.gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  user_id text default '',
+  user_name text default '',
+  role text default '',
+  action text not null,
+  details text default ''
+);
+create index if not exists idx_activity_created on activity_log (created_at desc);
+create index if not exists idx_activity_user on activity_log (user_id);
+alter table activity_log enable row level security;
+drop policy if exists "activity add" on activity_log;
+drop policy if exists "activity read" on activity_log;
+create policy "activity add" on activity_log for insert with check (true);
+create policy "activity read" on activity_log for select using (true);
+
 -- ---------------- INDEXES ----------------
 
 create index if not exists idx_subjects_batch on subjects(batch_id);
@@ -161,7 +206,7 @@ create policy "public read/write config" on config for all using (true) with che
 -- ---------------- AUTH FUNCTIONS ----------------
 -- These run as their owner (a privileged role), not as the caller, so they
 -- can read/write `users` despite it having no RLS policy for the public key.
--- Roles: 'Admin' | 'Teacher' | 'Tele Caller' | 'Floor Incharge'.
+-- Roles: 'Admin', 'Teacher', or any custom name the admin types (e.g. 'Tele Caller').
 -- `permissions` is the list of things a non-admin may use (admins always get everything).
 
 create or replace function rpc_login(p_username text, p_password text)
@@ -267,7 +312,7 @@ begin
   end if;
   insert into users (name, username, password_hash, role, assigned_batch_ids, permissions)
   values (p_name, p_username, encode(extensions.digest(coalesce(p_password, 'changeme123'), 'sha256'), 'hex'),
-          case when p_role in ('Admin', 'Teacher', 'Tele Caller', 'Floor Incharge') then p_role else 'Teacher' end,
+          case when lower(trim(coalesce(p_role, ''))) = 'admin' then 'Admin' when trim(coalesce(p_role, '')) = '' then 'Teacher' else trim(p_role) end,
           coalesce(p_assigned_batch_ids, '{}'), coalesce(p_permissions, '{}'))
   returning id into new_id;
   return json_build_object('success', true, 'id', new_id);
@@ -283,7 +328,7 @@ as $$
 begin
   update users set
     name = coalesce(p_name, name),
-    role = coalesce(case when p_role in ('Admin', 'Teacher', 'Tele Caller', 'Floor Incharge') then p_role else null end, role),
+    role = coalesce(case when p_role is null or trim(p_role) = '' then null when lower(trim(p_role)) = 'admin' then 'Admin' else trim(p_role) end, role),
     assigned_batch_ids = coalesce(p_assigned_batch_ids, assigned_batch_ids),
     permissions = coalesce(p_permissions, permissions),
     active = coalesce(p_active, active),
@@ -371,7 +416,7 @@ insert into users (name, username, password_hash, role)
 select 'Administrator', 'admin', encode(extensions.digest('admin123', 'sha256'), 'hex'), 'Admin'
 where not exists (select 1 from users where username = 'admin');
 
-insert into config (key, value) values ('InstituteName', 'My Coaching Institute')
+insert into config (key, value) values ('InstituteName', 'Unacademy Class Attendance')
   on conflict (key) do nothing;
 insert into config (key, value) values ('DefaulterThreshold', '75')
   on conflict (key) do nothing;

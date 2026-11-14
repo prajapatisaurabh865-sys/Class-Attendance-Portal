@@ -134,10 +134,32 @@ async function insertChunked_(table, rows, opts) {
 /* -------- row → the same shape script.js already expects -------- */
 function rowToBatch_(r) { return { ID: r.id, Name: r.name, Description: r.description || '', Active: r.active, Closed: !!r.closed, ClosedAt: r.closed_at || '' }; }
 function rowToSubject_(r) { return { ID: r.id, Name: r.name, BatchID: r.batch_id, Active: r.active }; }
+const CONTACT_LABELS_ = ['Student', 'Father', 'Mother', 'Guardian', 'Brother', 'Sister', 'Uncle', 'Aunt', 'Grandparent', 'Other'];
+/** Ordered phone numbers of a student: the order IS the calling order (first = call first). */
+function normalizeContacts_(r) {
+  let c = r ? r.contacts : null;
+  if (typeof c === 'string') { try { c = JSON.parse(c); } catch (e) { c = null; } }
+  if (!Array.isArray(c) || !c.length) {
+    c = [];
+    if (r && r.phone) c.push({ label: 'Student', number: r.phone });
+    if (r && r.parent_phone) c.push({ label: 'Parent', number: r.parent_phone });
+  }
+  return c.filter(function (x) { return x && String(x.number || '').trim(); })
+    .map(function (x) { return { label: String(x.label || 'Other'), number: String(x.number).trim() }; });
+}
+/** Keeps the old single phone / parent_phone columns in step with the contact list (used by search, CSV, older screens). */
+function contactPatch_(contacts) {
+  const list = (contacts || []).filter(function (x) { return x && String(x.number || '').trim(); })
+    .map(function (x) { return { label: String(x.label || 'Other'), number: String(x.number).trim() }; });
+  const own = list.find(function (x) { return x.label === 'Student'; });
+  const other = list.find(function (x) { return x.label !== 'Student'; });
+  return { contacts: list, phone: own ? own.number : '', parent_phone: other ? other.number : '' };
+}
+
 function rowToStudent_(r) {
   return {
     ID: r.id, Name: r.name, RollNo: r.roll_no || '', BatchID: r.batch_id,
-    Phone: r.phone || '', Email: r.email || '', ParentPhone: r.parent_phone || '',
+    Phone: r.phone || '', Email: r.email || '', ParentPhone: r.parent_phone || '', Contacts: normalizeContacts_(r),
     AdmissionDate: r.admission_date || '', Active: r.active,
     Discontinued: !!r.discontinued, DiscontinuedAt: r.discontinued_at || '', DiscontinueReason: r.discontinue_reason || ''
   };
@@ -338,25 +360,29 @@ const API = {
     return data.map(rowToStudent_);
   },
   createStudent: async function (role, data) {
-    requirePerm_('students');
+    requirePerm_('student_add');
     const id = uid_();
+    const cp = data.contacts ? contactPatch_(data.contacts) : { contacts: normalizeContacts_({ phone: data.phone, parent_phone: data.parentPhone }), phone: data.phone || '', parent_phone: data.parentPhone || '' };
     const { error } = await sb.from('students').insert({
       id: id, name: data.name, roll_no: data.rollNo || '', batch_id: data.batchId,
-      phone: data.phone || '', email: data.email || '', parent_phone: data.parentPhone || '',
+      phone: cp.phone, email: data.email || '', parent_phone: cp.parent_phone, contacts: cp.contacts,
       admission_date: data.admissionDate || new Date().toISOString().slice(0, 10)
     });
     throwIfError_(error);
     return { success: true, id: id };
   },
   updateStudent: async function (role, data) {
-    requirePerm_('students');
+    requirePerm_('student_edit');
     const patch = {};
     if (data.name != null) patch.name = data.name;
     if (data.rollNo != null) patch.roll_no = data.rollNo;
     if (data.batchId != null) patch.batch_id = data.batchId;
-    if (data.phone != null) patch.phone = data.phone;
+    if (data.contacts) { const cp = contactPatch_(data.contacts); patch.contacts = cp.contacts; patch.phone = cp.phone; patch.parent_phone = cp.parent_phone; }
+    else {
+      if (data.phone != null) patch.phone = data.phone;
+      if (data.parentPhone != null) patch.parent_phone = data.parentPhone;
+    }
     if (data.email != null) patch.email = data.email;
-    if (data.parentPhone != null) patch.parent_phone = data.parentPhone;
     if (data.admissionDate != null) patch.admission_date = data.admissionDate;
     if (data.active != null) patch.active = data.active;
     const { error } = await sb.from('students').update(patch).eq('id', data.id);
@@ -364,7 +390,7 @@ const API = {
     return { success: true };
   },
   deleteStudent: async function (role, id) {
-    requirePerm_('students');
+    requirePerm_('student_delete');
     const { error } = await sb.from('students').update({ active: false }).eq('id', id);
     throwIfError_(error);
     return { success: true };
@@ -374,13 +400,13 @@ const API = {
     return data.map(rowToStudent_);
   },
   discontinueStudent: async function (role, id, reason) {
-    requirePerm_('students');
+    requirePerm_('student_discontinue');
     const { error } = await sb.from('students').update({ discontinued: true, discontinued_at: todayStr(), discontinue_reason: reason || '' }).eq('id', id);
     throwIfError_(error);
     return { success: true };
   },
   restoreStudent: async function (role, id) {
-    requirePerm_('students');
+    requirePerm_('student_discontinue');
     const { error } = await sb.from('students').update({ discontinued: false, discontinued_at: null, discontinue_reason: '' }).eq('id', id);
     throwIfError_(error);
     return { success: true };
@@ -416,7 +442,7 @@ const API = {
       batches: allBatches.filter(function (b) { return !b.Closed; }),
       closedBatches: allBatches.filter(function (b) { return b.Closed; }),
       subjects: subjects, students: students, discontinued: discontinued,
-      instituteName: config.InstituteName || 'Attendance Manager',
+      instituteName: config.InstituteName || 'Unacademy Class Attendance',
       defaulterThreshold: Number(config.DefaulterThreshold || 75)
     };
   },
@@ -530,7 +556,7 @@ const API = {
   getAbsenteesForDate: async function (batchId, date) {
     const [res, cnt, offRes] = await Promise.all([
       sb.from('attendance')
-        .select('student_id, remark, reason, color, subjects(name), students(name, roll_no, phone, parent_phone)')
+        .select('student_id, remark, reason, color, subjects(name), students(name, roll_no, phone, parent_phone, contacts)')
         .eq('batch_id', batchId).eq('date', date).eq('status', 'Absent'),
       sb.from('attendance').select('id', { count: 'exact', head: true }).eq('batch_id', batchId).eq('date', date),
       sb.from('class_off').select('type, remark').eq('batch_id', batchId).eq('date', date)
@@ -545,7 +571,7 @@ const API = {
         const s = r.students;
         byStudent[r.student_id] = {
           studentId: r.student_id, name: s ? s.name : '(deleted student)', rollNo: s ? (s.roll_no || '') : '',
-          phone: s ? (s.phone || '') : '', parentPhone: s ? (s.parent_phone || '') : '',
+          phone: s ? (s.phone || '') : '', parentPhone: s ? (s.parent_phone || '') : '', contacts: s ? normalizeContacts_(s) : [],
           subjects: [], remark: '', reason: '', color: ''
         };
       }
@@ -612,11 +638,52 @@ const API = {
     return {
       student: studentRow ? {
         name: studentRow.name, rollNo: studentRow.roll_no || '', phone: studentRow.phone || '',
-        parentPhone: studentRow.parent_phone || '', batchName: studentRow.batches ? studentRow.batches.name : ''
+        parentPhone: studentRow.parent_phone || '', contacts: normalizeContacts_(studentRow), batchName: studentRow.batches ? studentRow.batches.name : ''
       } : null,
       summary: { total: total, present: present, absent: total - present, percentage: total ? Math.round((present / total) * 1000) / 10 : 0 },
       records: records
     };
+  },
+
+  /** One student who moved between batches shows up as several student profiles — this adds their reports together. */
+  getCombinedReportCard: async function (ids, filters) {
+    const cards = await Promise.all(ids.map(function (id) { return API.getStudentReportCard(id, filters); }));
+    const valid = cards.filter(function (c) { return c.student; });
+    if (!valid.length) return { student: null, profiles: [], summary: { total: 0, present: 0, absent: 0, percentage: 0 }, records: [] };
+    const records = [].concat.apply([], valid.map(function (c) { return c.records; }))
+      .sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : 0; });
+    const total = records.length;
+    const present = records.filter(function (r) { return r.status === 'Present' || r.status === 'Late'; }).length;
+    const uniq = function (arr) { return arr.filter(function (v, i) { return v && arr.indexOf(v) === i; }); };
+    const batchOrder = uniq(records.slice().reverse().map(function (r) { return r.batchName; })); // oldest batch first
+    const profiles = valid.map(function (c) { return { name: c.student.name, rollNo: c.student.rollNo, batchName: c.student.batchName, contacts: c.student.contacts, summary: c.summary }; });
+    return {
+      student: {
+        name: uniq(valid.map(function (c) { return c.student.name; })).join(' / '),
+        rollNo: uniq(valid.map(function (c) { return c.student.rollNo; })).join(' / '),
+        batchName: (batchOrder.length ? batchOrder : uniq(valid.map(function (c) { return c.student.batchName; }))).join(' → '),
+        contacts: valid[0].student.contacts
+      },
+      profiles: profiles,
+      summary: { total: total, present: present, absent: total - present, percentage: total ? Math.round((present / total) * 1000) / 10 : 0 },
+      records: records
+    };
+  },
+
+  /* ---------------- ACTIVITY LOG (admin) ---------------- */
+
+  listActivity: async function (filters) {
+    requireAdmin_();
+    const f = filters || {};
+    const size = f.pageSize || 50, page = f.page || 0;
+    let q = sb.from('activity_log').select('*', { count: 'exact' }).order('created_at', { ascending: false });
+    if (f.userId) q = q.eq('user_id', f.userId);
+    if (f.from) q = q.gte('created_at', new Date(f.from + 'T00:00:00').toISOString());
+    if (f.to) q = q.lte('created_at', new Date(f.to + 'T23:59:59').toISOString());
+    if (f.search) { const t = f.search.replace(/[%,()]/g, ' ').trim(); if (t) q = q.or('action.ilike.%' + t + '%,details.ilike.%' + t + '%'); }
+    const { data, error, count } = await q.range(page * size, page * size + size - 1);
+    throwIfError_(error);
+    return { rows: data, total: count || 0 };
   },
 
   /* ---------------- BULK ATTENDANCE IMPORT (historical backfill) ---------------- */
@@ -779,7 +846,7 @@ const API = {
   /* ---------------- EXPORT (CSV / Excel / PDF — all done in-browser now) ---------------- */
 
   exportTable: async function (format, title, headers, rows) {
-    requirePerm_('export');
+    requireAdmin_();
     if (format === 'csv') return exportCsv_(title, headers, rows);
     if (format === 'xlsx') return exportXlsx_(title, headers, rows);
     if (format === 'pdf') return exportPdf_(title, headers, rows);
@@ -822,3 +889,74 @@ async function gs(fnName) {
   if (!API[fnName]) throw new Error('Unknown function: ' + fnName);
   return API[fnName].apply(null, args);
 }
+
+
+/* ================= ACTIVITY LOG: who did what =================
+   Every change made through the app is written to the activity_log table with the
+   login that did it. A failure to write the log never blocks the real action. */
+
+function logActivity_(action, details, userOverride) {
+  try {
+    const u = userOverride || currentUser_();
+    if (!u) return;
+    sb.from('activity_log').insert({ user_id: String(u.id || ''), user_name: u.name || u.username || '', role: u.role || '', action: action, details: details || '' })
+      .then(function () { }, function () { });
+  } catch (e) { /* never block the action */ }
+}
+const AUDIT_NAMES_ = {
+  batch: function (id) { return (typeof batchNameAny === 'function') ? batchNameAny(id) : id; },
+  subject: function (id) { const x = (state.subjects || []).find(function (v) { return v.ID === id; }); return x ? x.Name : id; },
+  student: function (id) {
+    const x = (state.students || []).concat(state.discontinued || []).find(function (v) { return v.ID === id; });
+    return x ? x.Name + (x.RollNo ? ' (' + x.RollNo + ')' : '') : id;
+  }
+};
+(function wireAudit_() {
+  const N = AUDIT_NAMES_;
+  const rows = {
+    login: function (a, res) { return (res && !res.error) ? { action: 'Login', details: '', user: res } : null; },
+    changeOwnPassword: function (a, res) { return (res && res.error) ? null : { action: 'Password changed', details: 'Own password' }; },
+    submitAttendance: function (a) {
+      const recs = a[4] || [], c = { Present: 0, Absent: 0, Late: 0 };
+      recs.forEach(function (r) { if (c[r.status] != null) c[r.status]++; });
+      return { action: 'Attendance saved', details: N.batch(a[2]) + ' · ' + N.subject(a[3]) + ' · ' + a[1] + ' — ' + recs.length + ' students (P ' + c.Present + ', A ' + c.Absent + ', L ' + c.Late + ')' };
+    },
+    setClassOff: function (a) { return { action: 'Day marked: ' + a[4], details: N.batch(a[2]) + ' · ' + a[1] + (a[5] ? ' — ' + a[5] : '') }; },
+    saveAbsenteeCall: function (a) { const d = a[4] || {}; return { action: 'Calling note saved', details: N.student(a[1]) + ' · ' + a[3] + (d.color ? ' · flag ' + d.color : '') + (d.remark ? ' — ' + d.remark : '') }; },
+    createBatch: function (a) { return { action: 'Batch added', details: a[1].name }; },
+    updateBatch: function (a) { return { action: 'Batch edited', details: N.batch(a[1].id) + (a[1].name ? ' → ' + a[1].name : '') }; },
+    closeBatch: function (a) { return { action: 'Batch closed', details: N.batch(a[1]) }; },
+    restoreBatch: function (a) { return { action: 'Batch restored', details: N.batch(a[1]) }; },
+    deleteBatch: function (a) { return { action: 'Batch deleted', details: N.batch(a[1]) }; },
+    createSubject: function (a) { return { action: 'Subject added', details: a[1].name + ' · ' + N.batch(a[1].batchId) }; },
+    updateSubject: function (a) { return { action: 'Subject edited', details: N.subject(a[1].id) + (a[1].name ? ' → ' + a[1].name : '') }; },
+    deleteSubject: function (a) { return { action: 'Subject deleted', details: N.subject(a[1]) }; },
+    createStudent: function (a) { return { action: 'Student added', details: a[1].name + (a[1].rollNo ? ' (' + a[1].rollNo + ')' : '') + ' · ' + N.batch(a[1].batchId) }; },
+    updateStudent: function (a) { return { action: 'Student edited', details: N.student(a[1].id) + (a[1].name ? ' → ' + a[1].name : '') }; },
+    deleteStudent: function (a) { return { action: 'Student deleted', details: N.student(a[1]) }; },
+    discontinueStudent: function (a) { return { action: 'Student discontinued', details: N.student(a[1]) + (a[2] ? ' — ' + a[2] : '') }; },
+    restoreStudent: function (a) { return { action: 'Student restored', details: N.student(a[1]) }; },
+    bulkImportStudents: function (a, res) { return { action: 'Bulk import: students', details: N.batch(a[1]) + ' — ' + JSON.stringify(res).slice(0, 160) }; },
+    bulkImportAttendance: function (a, res) { return { action: 'Bulk import: attendance', details: JSON.stringify(res).slice(0, 200) }; },
+    createUser: function (a, res) { return (res && res.error) ? null : { action: 'Login created', details: a[1].username + ' · ' + a[1].role }; },
+    updateUser: function (a, res, pre) { return (res && res.error) ? null : { action: 'Login edited', details: (pre || a[1].name || a[1].id) + (a[1].role ? ' · ' + a[1].role : '') + (a[1].newPassword ? ' · password reset' : '') + (a[1].active === false ? ' · disabled' : '') }; },
+    deleteUser: function (a, res, pre) { return { action: 'Login deleted', details: pre || a[1] }; },
+    updateSettings: function () { return { action: 'Settings changed', details: '' }; },
+    exportTable: function (a) { return { action: 'Export ' + String(a[0]).toUpperCase(), details: a[1] }; }
+  };
+  const needsLookup = { updateUser: 1, deleteUser: 1 };
+  Object.keys(rows).forEach(function (name) {
+    const orig = API[name];
+    if (!orig) return;
+    API[name] = async function () {
+      const args = Array.prototype.slice.call(arguments);
+      let pre = null;
+      if (needsLookup[name]) {
+        try { const id = name === 'deleteUser' ? args[1] : args[1].id; const list = await API.listUsers(); const u = (list || []).find(function (x) { return x.id === id; }); pre = u ? u.name + ' (' + u.username + ')' : null; } catch (e) { }
+      }
+      const res = await orig.apply(API, args);
+      try { const e = rows[name](args, res, pre); if (e) logActivity_(e.action, e.details, e.user); } catch (e) { }
+      return res;
+    };
+  });
+})();
