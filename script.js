@@ -515,9 +515,9 @@ function onMarkBatchChange() {
 function subjectNameById_(id) { const s = state.subjects.find(function (x) { return x.ID === id; }); return s ? s.Name : '?'; }
 
 /** Works out what is already saved so the screen shows it (e.g. attendance that came from a bulk upload). */
-function buildSessionContext_(batchId, subjectId, date, isAll, rows) {
+function buildSessionContext_(batchId, subjectId, date, isAll, rows, offRows) {
   const subjectIds = state.subjects.filter(function (s) { return s.BatchID === batchId; }).map(function (s) { return s.ID; });
-  const ctx = { batchId: batchId, subjectId: subjectId, date: date, isAll: isAll, subjectIds: subjectIds, bySubject: {}, orig: {}, notes: {}, hasExisting: false };
+  const ctx = { batchId: batchId, subjectId: subjectId, date: date, isAll: isAll, subjectIds: subjectIds, bySubject: {}, orig: {}, notes: {}, hasExisting: false, off: {}, offType: null, offRemark: '', offNote: '' };
   const per = {};
   rows.forEach(function (r) {
     if (isAll && subjectIds.indexOf(r.SubjectID) === -1) return;
@@ -525,6 +525,15 @@ function buildSessionContext_(batchId, subjectId, date, isAll, rows) {
     (ctx.bySubject[r.SubjectID] = ctx.bySubject[r.SubjectID] || {})[r.StudentID] = r.Status;
     (per[r.StudentID] = per[r.StudentID] || []).push({ sid: r.SubjectID, status: r.Status });
   });
+  (offRows || []).forEach(function (r) { ctx.off[r.SubjectID] = r; });
+  const slots = isAll ? subjectIds : [subjectId];
+  const offSlots = slots.filter(function (sid) { return ctx.off[sid]; });
+  if (slots.length && offSlots.length === slots.length && !ctx.hasExisting) {
+    ctx.offType = ctx.off[offSlots[0]].Type;
+    ctx.offRemark = ctx.off[offSlots[0]].Remark || '';
+  } else if (offSlots.length) {
+    ctx.offNote = offSlots.map(function (sid) { return subjectNameById_(sid) + ' (' + ctx.off[sid].Type + (ctx.off[sid].Remark ? ': ' + ctx.off[sid].Remark : '') + ')'; }).join(', ');
+  }
   Object.keys(per).forEach(function (stu) {
     const list = per[stu];
     const has = function (st) { return list.some(function (x) { return x.status === st; }); };
@@ -557,12 +566,13 @@ function loadSession(btn) {
 
   const isAll = subjectId === '__ALL__';
   area.innerHTML = '<div class="empty-state">Loading attendance…</div>';
-  const load = isAll
-    ? gs('getBatchDayAttendance', batchId, date)
-    : gs('getSessionAttendance', batchId, subjectId, date);
-  const task = load.then(function (rows) {
+  const load = Promise.all([
+    isAll ? gs('getBatchDayAttendance', batchId, date) : gs('getSessionAttendance', batchId, subjectId, date),
+    gs('getClassOff', batchId, date).catch(function () { return []; })
+  ]);
+  const task = load.then(function (res) {
     if (token !== sessionToken) return; // a newer selection took over
-    sessionCtx = buildSessionContext_(batchId, subjectId, date, isAll, rows);
+    sessionCtx = buildSessionContext_(batchId, subjectId, date, isAll, res[0], res[1]);
     renderMarkRoster(sessionCtx, roster);
   }).catch(function (e) {
     if (token === sessionToken) { area.innerHTML = '<div class="empty-state">Could not load attendance.</div>'; toast(e.message || String(e), 'error'); }
@@ -572,9 +582,9 @@ function loadSession(btn) {
 
 function renderMarkRoster(ctx, roster) {
   const rows = roster.map(function (s) {
-    const status = ctx.orig[s.ID] || 'Present';
+    const status = ctx.orig[s.ID] || ''; // nothing is assumed — unmarked stays unmarked
     const searchBlob = (s.Name + ' ' + (s.RollNo || '') + ' ' + (s.Phone || '')).toLowerCase();
-    return '<div class="attendance-row" data-student="' + s.ID + '" data-search="' + esc(searchBlob) + '">' +
+    return '<div class="attendance-row' + (status ? '' : ' unmarked') + '" data-student="' + s.ID + '" data-search="' + esc(searchBlob) + '">' +
       '<div>' + esc(s.Name) + (s.RollNo ? ' <span class="muted">(' + esc(s.RollNo) + ')</span>' : '') +
         (ctx.notes[s.ID] ? '<div class="muted" style="font-size:12px">' + esc(ctx.notes[s.ID]) + '</div>' : '') + '</div>' +
       '<div class="status-toggle">' +
@@ -592,26 +602,75 @@ function renderMarkRoster(ctx, roster) {
       ? 'Showing attendance already saved for ' + fmtDate(ctx.date) + ' (including bulk-uploaded data). Anyone absent in any subject shows as Absent. Change a student here and it applies to every subject held that day; students you don\'t touch keep their own per-subject marks.'
       : 'Showing attendance already saved for this subject on ' + fmtDate(ctx.date) + '.';
   } else {
-    banner = 'Nothing saved yet for ' + fmtDate(ctx.date) + ' — everyone starts as Present.';
+    banner = 'Nothing saved yet for ' + fmtDate(ctx.date) + '. Mark each student, or use Quick actions (All present / All absent / Holiday / Class cancelled / No class).';
   }
+  if (ctx.offNote) banner += ' Not held: ' + ctx.offNote + '.';
 
   document.getElementById('sessionArea').innerHTML =
     '<div class="card">' +
       '<div class="card-header"><h3>' + heading + '</h3>' +
-        '<div><button class="btn btn-secondary btn-sm" onclick="markAll(\'Present\')">All present</button> ' +
-        '<button class="btn btn-secondary btn-sm" onclick="markAll(\'Absent\')">All absent</button></div></div>' +
+        '<div class="quick-wrap"><span class="mark-count" id="markCount"></span>' +
+          '<select id="quickAction" class="quick-select" onchange="onQuickAction(this.value)">' +
+            '<option value="">Quick actions…</option>' +
+            '<option value="Present">All present</option><option value="Absent">All absent</option>' +
+            '<optgroup label="Whole day off"><option value="Holiday">Holiday</option><option value="Class Cancelled">Class cancelled</option><option value="No Class">No class</option></optgroup>' +
+          '</select></div></div>' +
       '<p class="muted" style="margin:-8px 0 14px">' + esc(banner) + '</p>' +
-      '<div class="field" style="max-width:320px"><input type="text" id="rosterSearch" placeholder="Search by name, roll no, or phone…" oninput="filterRoster()"></div>' +
-      '<div id="rosterList">' + rows + '</div>' +
-      '<div id="rosterEmpty" class="empty-state" style="display:none">No students match your search.</div>' +
-      '<div style="margin-top:16px;text-align:right"><button class="btn btn-primary" onclick="saveSession(this)">Save attendance</button></div>' +
+      '<div id="offPanel" class="off-panel" style="display:none">' +
+        '<div class="off-title" id="offTitle"></div>' +
+        '<p class="muted" style="margin:4px 0 12px">No attendance is counted for this day, so nobody is marked absent and percentages are not affected.</p>' +
+        '<div class="field"><label>Remark / reason</label><input id="offRemark" placeholder="e.g. Diwali holiday, teacher on leave" value="' + esc(ctx.offRemark) + '"></div>' +
+      '</div>' +
+      '<div id="rosterBlock">' +
+        '<div class="field" style="max-width:320px"><input type="text" id="rosterSearch" placeholder="Search by name, roll no, or phone…" oninput="filterRoster()"></div>' +
+        '<div id="rosterList">' + rows + '</div>' +
+        '<div id="rosterEmpty" class="empty-state" style="display:none">No students match your search.</div>' +
+      '</div>' +
+      '<div style="margin-top:16px;text-align:right"><button class="btn btn-primary" onclick="saveSession(this)">Save</button></div>' +
     '</div>';
+  applyOffUi();
+  updateMarkCount();
+}
+
+/** Switches the screen between the student list and the Holiday / Cancelled / No class panel. */
+function applyOffUi() {
+  const ctx = sessionCtx;
+  if (!ctx) return;
+  const off = !!ctx.offType;
+  byId('rosterBlock').style.display = off ? 'none' : '';
+  byId('offPanel').style.display = off ? 'block' : 'none';
+  byId('markCount').style.display = off ? 'none' : '';
+  byId('quickAction').value = off ? ctx.offType : '';
+  if (off) byId('offTitle').textContent = (ctx.isAll ? 'Whole day' : 'This class') + ' marked as: ' + ctx.offType;
+}
+function onQuickAction(v) {
+  const ctx = sessionCtx;
+  if (!ctx || !v) return;
+  if (v === 'Present' || v === 'Absent') {
+    ctx.offType = null;
+    applyOffUi();
+    markAll(v);
+    byId('quickAction').value = '';
+  } else {
+    ctx.offType = v;
+    applyOffUi();
+    byId('offRemark').focus();
+  }
+}
+function updateMarkCount() {
+  const rows = document.querySelectorAll('.attendance-row');
+  const marked = document.querySelectorAll('.attendance-row .status-btn.selected').length;
+  const el = byId('markCount');
+  if (el) { el.textContent = 'Marked ' + marked + ' / ' + rows.length; el.classList.toggle('incomplete', marked < rows.length); }
 }
 
 function setStatus(btn, status) {
   const group = btn.parentElement;
   Array.prototype.forEach.call(group.children, function (b) { b.classList.remove('selected', 'present', 'absent', 'late'); });
   btn.classList.add('selected', status.toLowerCase());
+  const row = btn.closest('.attendance-row');
+  if (row) row.classList.remove('unmarked');
+  if (byId('markCount')) updateMarkCount();
 }
 function markAll(status) {
   document.querySelectorAll('.attendance-row').forEach(function (row) {
@@ -635,16 +694,26 @@ function filterRoster() {
 function saveSession(btn) {
   const ctx = sessionCtx; // always saves what was loaded, never whatever the filters were changed to afterwards
   if (!ctx) { toast('Load a session first', 'error'); return; }
+  if (ctx.offType) { saveOffDay(btn, ctx); return; }
+
   const cur = {};
+  let firstUnmarked = null, unmarkedCount = 0;
   document.querySelectorAll('.attendance-row').forEach(function (row) {
     const selected = row.querySelector('.status-btn.selected');
-    cur[row.getAttribute('data-student')] = selected ? selected.getAttribute('data-status') : 'Present';
+    if (!selected) { unmarkedCount++; if (!firstUnmarked) firstUnmarked = row; return; }
+    cur[row.getAttribute('data-student')] = selected.getAttribute('data-status');
   });
+  if (unmarkedCount) {
+    byId('rosterSearch').value = ''; filterRoster();
+    firstUnmarked.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    toast(unmarkedCount + ' student(s) not marked yet — mark everyone, or use Quick actions', 'error');
+    return;
+  }
   const studentIds = Object.keys(cur);
 
   let targets;
   if (!ctx.isAll) targets = [ctx.subjectId];
-  else if (!ctx.hasExisting) targets = ctx.subjectIds; // fresh day — mark every subject
+  else if (!ctx.hasExisting) targets = ctx.subjectIds.filter(function (sid) { return !ctx.off[sid]; }); // fresh day — every subject that isn't off
   else targets = ctx.subjectIds.filter(function (sid) { return ctx.bySubject[sid] && Object.keys(ctx.bySubject[sid]).length; }); // only classes that were actually held
   if (!targets.length) { toast('This batch has no subjects yet — add one from Subjects first', 'error'); return; }
 
@@ -664,6 +733,18 @@ function saveSession(btn) {
     loadSession();
   }).catch(function (e) { toast(e.message || String(e), 'error'); });
 
+  if (btn) runWithLoading(btn, 'Saving…', function () { return task; });
+}
+
+function saveOffDay(btn, ctx) {
+  const remark = (byId('offRemark').value || '').trim();
+  const targets = ctx.isAll ? ctx.subjectIds : [ctx.subjectId];
+  if (ctx.hasExisting && !confirm('Attendance already saved for ' + fmtDate(ctx.date) + ' will be deleted and the day marked as "' + ctx.offType + '". Continue?')) return;
+  const task = gs('setClassOff', state.user, ctx.date, ctx.batchId, targets, ctx.offType, remark).then(function () {
+    clearAttendanceCaches();
+    toast('Marked as ' + ctx.offType, 'success');
+    loadSession();
+  }).catch(function (e) { toast(e.message || String(e), 'error'); });
   if (btn) runWithLoading(btn, 'Saving…', function () { return task; });
 }
 
@@ -821,6 +902,8 @@ function renderAbsenteeList(res, batchId, date) {
   if (!absentees.length) {
     area.innerHTML = res.totalMarked
       ? '<div class="empty-state">No absentees for this batch on ' + fmtDate(date) + ' 🎉</div>'
+      : (res.off && res.off.length)
+      ? '<div class="empty-state">' + res.off.map(function (o) { return esc(o.type) + (o.remark ? ' — ' + esc(o.remark) : ''); }).join('<br>') + '<br><span style="font-size:12.5px">No attendance for ' + fmtDate(date) + ', so there is nobody to call.</span></div>'
       : '<div class="empty-state">No attendance has been marked for this batch on ' + fmtDate(date) + '.<br>' +
         '<span style="font-size:12.5px">If you uploaded this date from a CSV, check that you picked the same batch name that was written in the CSV.</span></div>';
     return;

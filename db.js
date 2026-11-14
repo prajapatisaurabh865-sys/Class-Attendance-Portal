@@ -457,7 +457,30 @@ const API = {
       };
     });
     if (rows.length) { const { error } = await sb.from('attendance').insert(rows); throwIfError_(error); }
+    // attendance is now marked for this class, so it can no longer be flagged Holiday / Cancelled / No class
+    await sb.from('class_off').delete().eq('date', date).eq('batch_id', batchId).eq('subject_id', subjectId);
     return { success: true, count: rows.length };
+  },
+
+  /** Holiday / Class Cancelled / No Class for a batch on a day (one row per subject). Replaces any attendance saved for those classes. */
+  setClassOff: async function (user, date, batchId, subjectIds, type, remark) {
+    requirePerm_('mark');
+    assertBatchAccess_(user, batchId);
+    if (['Holiday', 'Class Cancelled', 'No Class'].indexOf(type) === -1) throw new Error('Unknown day type.');
+    if (!subjectIds || !subjectIds.length) throw new Error('This batch has no subjects yet.');
+    const del = await sb.from('attendance').delete().eq('date', date).eq('batch_id', batchId).in('subject_id', subjectIds);
+    throwIfError_(del.error);
+    const rows = subjectIds.map(function (sid) {
+      return { date: date, batch_id: batchId, subject_id: sid, type: type, remark: remark || '', marked_by: user.name };
+    });
+    const { error } = await sb.from('class_off').upsert(rows, { onConflict: 'batch_id,subject_id,date' });
+    throwIfError_(error);
+    return { success: true };
+  },
+  getClassOff: async function (batchId, date) {
+    const { data, error } = await sb.from('class_off').select('subject_id, type, remark').eq('batch_id', batchId).eq('date', date);
+    throwIfError_(error);
+    return data.map(function (r) { return { SubjectID: r.subject_id, Type: r.type, Remark: r.remark || '' }; });
   },
 
   getSessionAttendance: async function (batchId, subjectId, date) {
@@ -505,11 +528,12 @@ const API = {
   /* ---------------- ABSENTEE CALLING ---------------- */
 
   getAbsenteesForDate: async function (batchId, date) {
-    const [res, cnt] = await Promise.all([
+    const [res, cnt, offRes] = await Promise.all([
       sb.from('attendance')
         .select('student_id, remark, reason, color, subjects(name), students(name, roll_no, phone, parent_phone)')
         .eq('batch_id', batchId).eq('date', date).eq('status', 'Absent'),
-      sb.from('attendance').select('id', { count: 'exact', head: true }).eq('batch_id', batchId).eq('date', date)
+      sb.from('attendance').select('id', { count: 'exact', head: true }).eq('batch_id', batchId).eq('date', date),
+      sb.from('class_off').select('type, remark').eq('batch_id', batchId).eq('date', date)
     ]);
     throwIfError_(res.error);
     throwIfError_(cnt.error);
@@ -533,7 +557,9 @@ const API = {
       if (!entry.color && r.color) entry.color = r.color;
     });
     const absentees = Object.keys(byStudent).map(function (k) { return byStudent[k]; }).sort(function (a, b) { return a.name < b.name ? -1 : 1; });
-    return { absentees: absentees, totalMarked: cnt.count || 0 };
+    const off = [];
+    ((offRes && offRes.data) || []).forEach(function (r) { if (!off.some(function (o) { return o.type === r.type && o.remark === (r.remark || ''); })) off.push({ type: r.type, remark: r.remark || '' }); });
+    return { absentees: absentees, totalMarked: cnt.count || 0, off: off };
   },
 
   saveAbsenteeCall: async function (role, studentId, batchId, date, data) {

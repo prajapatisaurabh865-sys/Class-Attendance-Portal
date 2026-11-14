@@ -102,6 +102,22 @@ begin
   end if;
 end $$;
 
+-- v3: Holiday / Class Cancelled / No Class days (kept out of attendance so they never affect percentages)
+create table if not exists class_off (
+  id uuid primary key default extensions.gen_random_uuid(),
+  date date not null,
+  batch_id uuid references batches(id) on delete cascade,
+  subject_id uuid references subjects(id) on delete cascade,
+  type text not null,            -- 'Holiday' | 'Class Cancelled' | 'No Class'
+  remark text default '',
+  marked_by text default '',
+  created_at timestamptz not null default now()
+);
+create unique index if not exists uq_class_off_slot on class_off (batch_id, subject_id, date);
+alter table class_off enable row level security;
+drop policy if exists "public read/write class_off" on class_off;
+create policy "public read/write class_off" on class_off for all using (true) with check (true);
+
 -- ---------------- INDEXES ----------------
 
 create index if not exists idx_subjects_batch on subjects(batch_id);
