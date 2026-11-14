@@ -14,8 +14,17 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-function requireAdmin_(role) {
-  if (role !== 'Admin') throw new Error('Only an admin can do this.');
+function currentUser_() { return (typeof state !== 'undefined' && state.user) ? state.user : null; }
+function can_(perm) {
+  const u = currentUser_();
+  if (!u) return false;
+  if (u.role === 'Admin') return true;
+  return Array.isArray(u.permissions) && u.permissions.indexOf(perm) !== -1;
+}
+function requirePerm_(perm) { if (!can_(perm)) throw new Error('You do not have permission to do this.'); }
+function requireAdmin_() {
+  const u = currentUser_();
+  if (!u || u.role !== 'Admin') throw new Error('Only an admin can do this.');
 }
 function assertBatchAccess_(user, batchId) {
   if (user.role === 'Admin') return;
@@ -123,13 +132,14 @@ async function insertChunked_(table, rows, opts) {
 }
 
 /* -------- row → the same shape script.js already expects -------- */
-function rowToBatch_(r) { return { ID: r.id, Name: r.name, Description: r.description || '', Active: r.active }; }
+function rowToBatch_(r) { return { ID: r.id, Name: r.name, Description: r.description || '', Active: r.active, Closed: !!r.closed, ClosedAt: r.closed_at || '' }; }
 function rowToSubject_(r) { return { ID: r.id, Name: r.name, BatchID: r.batch_id, Active: r.active }; }
 function rowToStudent_(r) {
   return {
     ID: r.id, Name: r.name, RollNo: r.roll_no || '', BatchID: r.batch_id,
     Phone: r.phone || '', Email: r.email || '', ParentPhone: r.parent_phone || '',
-    AdmissionDate: r.admission_date || '', Active: r.active
+    AdmissionDate: r.admission_date || '', Active: r.active,
+    Discontinued: !!r.discontinued, DiscontinuedAt: r.discontinued_at || '', DiscontinueReason: r.discontinue_reason || ''
   };
 }
 
@@ -137,7 +147,7 @@ const RECORD_COLUMNS_ = 'id, date, status, marked_by, remark, reason, color, bat
 function buildRecordsQuery_(filters, withCount) {
   let q = sb.from('attendance').select(RECORD_COLUMNS_, withCount ? { count: 'exact' } : undefined);
   if (filters.batchId) q = q.eq('batch_id', filters.batchId);
-  else if (filters.batchIds && filters.batchIds.length) q = q.in('batch_id', filters.batchIds);
+  else if (filters.batchIds) q = q.in('batch_id', filters.batchIds.length ? filters.batchIds : ['00000000-0000-0000-0000-000000000000']); // no batches assigned → no rows
   if (filters.subjectId) q = q.eq('subject_id', filters.subjectId);
   if (filters.studentId) q = q.eq('student_id', filters.studentId);
   if (filters.from) q = q.gte('date', filters.from);
@@ -155,6 +165,14 @@ function rowToRecord_(r) {
     parentPhone: r.students ? (r.students.parent_phone || '') : '',
     status: r.status, markedBy: r.marked_by || '', remark: r.remark || '', reason: r.reason || '', color: r.color || ''
   };
+}
+
+/** Non-admin staff only ever see report rows for the batches they're assigned to. */
+function restrictToMyBatches_(rows) {
+  const u = currentUser_();
+  if (!u || u.role === 'Admin') return rows;
+  const ids = u.assignedBatchIds || [];
+  return rows.filter(function (r) { return !r.batchId || ids.indexOf(r.batchId) !== -1; });
 }
 
 function studentWiseFromRecords_(records) {
@@ -200,33 +218,40 @@ const API = {
     throwIfError_(error);
     return data;
   },
+  /** Re-checks a saved login against the database (still active? role / access changed?). */
+  getSessionUser: async function (userId) {
+    const { data, error } = await sb.rpc('rpc_get_session_user', { p_user_id: userId });
+    throwIfError_(error);
+    return data;
+  },
   listUsers: async function (role) {
-    requireAdmin_(role);
+    requireAdmin_();
     const { data, error } = await sb.rpc('rpc_list_users');
     throwIfError_(error);
     return data;
   },
   createUser: async function (role, data) {
-    requireAdmin_(role);
+    requireAdmin_();
     const { data: res, error } = await sb.rpc('rpc_create_user', {
       p_name: data.name, p_username: data.username, p_password: data.password,
-      p_role: data.role, p_assigned_batch_ids: data.assignedBatchIds || []
+      p_role: data.role, p_assigned_batch_ids: data.assignedBatchIds || [], p_permissions: data.permissions || []
     });
     throwIfError_(error);
     return res;
   },
   updateUser: async function (role, data) {
-    requireAdmin_(role);
+    requireAdmin_();
     const { data: res, error } = await sb.rpc('rpc_update_user', {
       p_id: data.id, p_name: data.name || null, p_role: data.role || null,
       p_assigned_batch_ids: data.assignedBatchIds || null,
-      p_active: data.active != null ? data.active : null, p_new_password: data.newPassword || null
+      p_active: data.active != null ? data.active : null, p_new_password: data.newPassword || null,
+      p_permissions: data.permissions || null
     });
     throwIfError_(error);
     return res;
   },
   deleteUser: async function (role, id) {
-    requireAdmin_(role);
+    requireAdmin_();
     const { data, error } = await sb.rpc('rpc_delete_user', { p_id: id });
     throwIfError_(error);
     return data;
@@ -240,14 +265,14 @@ const API = {
     return data.map(rowToBatch_);
   },
   createBatch: async function (role, data) {
-    requireAdmin_(role);
+    requirePerm_('batches');
     const id = uid_();
     const { error } = await sb.from('batches').insert({ id: id, name: data.name, description: data.description || '' });
     throwIfError_(error);
     return { success: true, id: id };
   },
   updateBatch: async function (role, data) {
-    requireAdmin_(role);
+    requirePerm_('batches');
     const patch = {};
     if (data.name != null) patch.name = data.name;
     if (data.description != null) patch.description = data.description;
@@ -257,8 +282,21 @@ const API = {
     return { success: true };
   },
   deleteBatch: async function (role, id) {
-    requireAdmin_(role);
+    requirePerm_('batches');
     const { error } = await sb.from('batches').update({ active: false }).eq('id', id);
+    throwIfError_(error);
+    return { success: true };
+  },
+
+  closeBatch: async function (role, id) {
+    requirePerm_('batches');
+    const { error } = await sb.from('batches').update({ closed: true, closed_at: todayStr() }).eq('id', id);
+    throwIfError_(error);
+    return { success: true };
+  },
+  restoreBatch: async function (role, id) {
+    requirePerm_('batches');
+    const { error } = await sb.from('batches').update({ closed: false, closed_at: null }).eq('id', id);
     throwIfError_(error);
     return { success: true };
   },
@@ -270,14 +308,14 @@ const API = {
     return data.map(rowToSubject_);
   },
   createSubject: async function (role, data) {
-    requireAdmin_(role);
+    requirePerm_('subjects');
     const id = uid_();
     const { error } = await sb.from('subjects').insert({ id: id, name: data.name, batch_id: data.batchId });
     throwIfError_(error);
     return { success: true, id: id };
   },
   updateSubject: async function (role, data) {
-    requireAdmin_(role);
+    requirePerm_('subjects');
     const patch = {};
     if (data.name != null) patch.name = data.name;
     if (data.batchId != null) patch.batch_id = data.batchId;
@@ -287,7 +325,7 @@ const API = {
     return { success: true };
   },
   deleteSubject: async function (role, id) {
-    requireAdmin_(role);
+    requirePerm_('subjects');
     const { error } = await sb.from('subjects').update({ active: false }).eq('id', id);
     throwIfError_(error);
     return { success: true };
@@ -296,11 +334,11 @@ const API = {
   /* ---------------- STUDENTS ---------------- */
 
   listStudents: async function () {
-    const data = await fetchAll_(function () { return sb.from('students').select('*').eq('active', true).order('name').order('id'); });
+    const data = await fetchAll_(function () { return sb.from('students').select('*').eq('active', true).eq('discontinued', false).order('name').order('id'); });
     return data.map(rowToStudent_);
   },
   createStudent: async function (role, data) {
-    requireAdmin_(role);
+    requirePerm_('students');
     const id = uid_();
     const { error } = await sb.from('students').insert({
       id: id, name: data.name, roll_no: data.rollNo || '', batch_id: data.batchId,
@@ -311,7 +349,7 @@ const API = {
     return { success: true, id: id };
   },
   updateStudent: async function (role, data) {
-    requireAdmin_(role);
+    requirePerm_('students');
     const patch = {};
     if (data.name != null) patch.name = data.name;
     if (data.rollNo != null) patch.roll_no = data.rollNo;
@@ -326,13 +364,29 @@ const API = {
     return { success: true };
   },
   deleteStudent: async function (role, id) {
-    requireAdmin_(role);
+    requirePerm_('students');
     const { error } = await sb.from('students').update({ active: false }).eq('id', id);
     throwIfError_(error);
     return { success: true };
   },
+  listDiscontinuedStudents: async function () {
+    const data = await fetchAll_(function () { return sb.from('students').select('*').eq('active', true).eq('discontinued', true).order('name').order('id'); });
+    return data.map(rowToStudent_);
+  },
+  discontinueStudent: async function (role, id, reason) {
+    requirePerm_('students');
+    const { error } = await sb.from('students').update({ discontinued: true, discontinued_at: todayStr(), discontinue_reason: reason || '' }).eq('id', id);
+    throwIfError_(error);
+    return { success: true };
+  },
+  restoreStudent: async function (role, id) {
+    requirePerm_('students');
+    const { error } = await sb.from('students').update({ discontinued: false, discontinued_at: null, discontinue_reason: '' }).eq('id', id);
+    throwIfError_(error);
+    return { success: true };
+  },
   bulkImportStudents: async function (role, batchId, csvText) {
-    requireAdmin_(role);
+    requirePerm_('bulk_import');
     let rows = parseCsv_(csvText);
     if (rows.length && /^name$/i.test((rows[0][0] || '').trim())) rows = rows.slice(1);
 
@@ -351,21 +405,23 @@ const API = {
   /* ---------------- BOOTSTRAP + SETTINGS ---------------- */
 
   getBootstrapData: async function () {
-    const [batches, subjects, students, configRes] = await Promise.all([
-      API.listBatches(), API.listSubjects(), API.listStudents(),
+    const [allBatches, subjects, students, discontinued, configRes] = await Promise.all([
+      API.listBatches(), API.listSubjects(), API.listStudents(), API.listDiscontinuedStudents(),
       sb.from('config').select('*')
     ]);
     throwIfError_(configRes.error);
     const config = {};
     configRes.data.forEach(function (r) { config[r.key] = r.value; });
     return {
-      batches: batches, subjects: subjects, students: students,
+      batches: allBatches.filter(function (b) { return !b.Closed; }),
+      closedBatches: allBatches.filter(function (b) { return b.Closed; }),
+      subjects: subjects, students: students, discontinued: discontinued,
       instituteName: config.InstituteName || 'Attendance Manager',
       defaulterThreshold: Number(config.DefaulterThreshold || 75)
     };
   },
   updateSettings: async function (role, data) {
-    requireAdmin_(role);
+    requireAdmin_();
     const upserts = [];
     if (data.instituteName != null) upserts.push({ key: 'InstituteName', value: String(data.instituteName) });
     if (data.defaulterThreshold != null) upserts.push({ key: 'DefaulterThreshold', value: String(data.defaulterThreshold) });
@@ -376,6 +432,7 @@ const API = {
   /* ---------------- ATTENDANCE ---------------- */
 
   submitAttendance: async function (user, date, batchId, subjectId, records) {
+    requirePerm_('mark');
     assertBatchAccess_(user, batchId);
     const { data: existing, error: selErr } = await sb.from('attendance').select('*')
       .eq('date', date).eq('batch_id', batchId).eq('subject_id', subjectId);
@@ -407,7 +464,15 @@ const API = {
     const { data, error } = await sb.from('attendance').select('*')
       .eq('batch_id', batchId).eq('subject_id', subjectId).eq('date', date);
     throwIfError_(error);
-    return data.map(function (r) { return { StudentID: r.student_id, Status: r.status }; });
+    return data.map(function (r) { return { StudentID: r.student_id, SubjectID: r.subject_id, Status: r.status }; });
+  },
+
+  /** Every mark for a whole batch on one day, across all its subjects (e.g. what a bulk upload created). */
+  getBatchDayAttendance: async function (batchId, date) {
+    const data = await fetchAll_(function () {
+      return sb.from('attendance').select('student_id, subject_id, status').eq('batch_id', batchId).eq('date', date).order('id');
+    });
+    return data.map(function (r) { return { StudentID: r.student_id, SubjectID: r.subject_id, Status: r.status }; });
   },
 
   getAttendanceRecords: async function (filters) {
@@ -440,10 +505,15 @@ const API = {
   /* ---------------- ABSENTEE CALLING ---------------- */
 
   getAbsenteesForDate: async function (batchId, date) {
-    const { data, error } = await sb.from('attendance')
-      .select('student_id, remark, reason, color, subjects(name), students(name, roll_no, phone, parent_phone)')
-      .eq('batch_id', batchId).eq('date', date).eq('status', 'Absent');
-    throwIfError_(error);
+    const [res, cnt] = await Promise.all([
+      sb.from('attendance')
+        .select('student_id, remark, reason, color, subjects(name), students(name, roll_no, phone, parent_phone)')
+        .eq('batch_id', batchId).eq('date', date).eq('status', 'Absent'),
+      sb.from('attendance').select('id', { count: 'exact', head: true }).eq('batch_id', batchId).eq('date', date)
+    ]);
+    throwIfError_(res.error);
+    throwIfError_(cnt.error);
+    const data = res.data;
 
     const byStudent = {};
     data.forEach(function (r) {
@@ -462,10 +532,12 @@ const API = {
       if (!entry.reason && r.reason) entry.reason = r.reason;
       if (!entry.color && r.color) entry.color = r.color;
     });
-    return Object.keys(byStudent).map(function (k) { return byStudent[k]; }).sort(function (a, b) { return a.name < b.name ? -1 : 1; });
+    const absentees = Object.keys(byStudent).map(function (k) { return byStudent[k]; }).sort(function (a, b) { return a.name < b.name ? -1 : 1; });
+    return { absentees: absentees, totalMarked: cnt.count || 0 };
   },
 
   saveAbsenteeCall: async function (role, studentId, batchId, date, data) {
+    requirePerm_('calling');
     const patch = {};
     if (data.remark != null) patch.remark = data.remark;
     if (data.reason != null) patch.reason = data.reason;
@@ -485,7 +557,7 @@ const API = {
     const { data, error } = await sb.rpc('rpc_student_wise_report', {
       p_batch_id: filters.batchId || null, p_from: filters.from || null, p_to: filters.to || null
     });
-    if (!error) return data;
+    if (!error) return restrictToMyBatches_(data);
     return studentWiseFromRecords_(await API.getAttendanceRecords(filters)); // fallback if schema.sql wasn't re-run yet
   },
 
@@ -494,7 +566,7 @@ const API = {
     const { data, error } = await sb.rpc('rpc_batch_wise_report', {
       p_batch_id: filters.batchId || null, p_from: filters.from || null, p_to: filters.to || null
     });
-    if (!error) return data;
+    if (!error) return restrictToMyBatches_(data);
     return batchWiseFromRecords_(await API.getAttendanceRecords(filters));
   },
 
@@ -502,7 +574,7 @@ const API = {
     const configRes = await sb.from('config').select('*').eq('key', 'DefaulterThreshold').single();
     const threshold = Number((configRes.data && configRes.data.value) || 75);
     const report = await API.getStudentWiseReport(filters);
-    return report.filter(function (s) { return s.percentage < threshold && s.totalSessions > 0; });
+    return report.filter(function (s) { return s.percentage < threshold && s.totalSessions > 0 && !s.discontinued; });
   },
 
   getStudentReportCard: async function (studentId, filters) {
@@ -524,7 +596,7 @@ const API = {
   /* ---------------- BULK ATTENDANCE IMPORT (historical backfill) ---------------- */
 
   bulkImportAttendance: async function (role, csvText) {
-    requireAdmin_(role);
+    requirePerm_('bulk_import');
     const progress = function (msg) { if (typeof importProgress === 'function') importProgress(msg); };
 
     progress('Reading file…');
@@ -681,6 +753,7 @@ const API = {
   /* ---------------- EXPORT (CSV / Excel / PDF — all done in-browser now) ---------------- */
 
   exportTable: async function (format, title, headers, rows) {
+    requirePerm_('export');
     if (format === 'csv') return exportCsv_(title, headers, rows);
     if (format === 'xlsx') return exportXlsx_(title, headers, rows);
     if (format === 'pdf') return exportPdf_(title, headers, rows);

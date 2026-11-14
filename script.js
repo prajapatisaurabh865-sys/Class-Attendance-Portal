@@ -5,7 +5,7 @@
 
 const state = {
   user: null,
-  batches: [], subjects: [], students: [],
+  batches: [], closedBatches: [], subjects: [], students: [], discontinued: [],
   instituteName: 'Attendance Manager', defaulterThreshold: 75,
   view: 'home'
 };
@@ -90,7 +90,79 @@ function fmtDate(isoDate) {
   return m ? (m[3] + '/' + m[2] + '/' + m[1]) : isoDate;
 }
 
-/* ================= LOGIN ================= */
+
+/* ================= PERMISSIONS & ROLES ================= */
+
+const PERMISSIONS = [
+  { key: 'dashboard', label: 'Dashboard' },
+  { key: 'mark', label: 'Mark Attendance' },
+  { key: 'records', label: 'Records (view)' },
+  { key: 'calling', label: 'Absentees Calling sheet' },
+  { key: 'reports', label: 'Reports' },
+  { key: 'export', label: 'Export CSV / Excel / PDF' },
+  { key: 'students', label: 'Students (add, edit, discontinue, restore)' },
+  { key: 'batches', label: 'Batches (add, edit, close, restore)' },
+  { key: 'subjects', label: 'Subjects (add, edit)' },
+  { key: 'bulk_import', label: 'Bulk import (students & attendance history)' }
+];
+const ROLES = ['Teacher', 'Tele Caller', 'Floor Incharge', 'Admin'];
+/** What gets pre-ticked when a role is picked while creating a login — the admin can still tick/untick anything. */
+const ROLE_PRESETS = {
+  'Teacher': ['dashboard', 'mark', 'records', 'calling', 'reports'],
+  'Tele Caller': ['dashboard', 'calling', 'records'],
+  'Floor Incharge': ['dashboard', 'mark', 'records', 'calling', 'reports', 'export'],
+  'Admin': PERMISSIONS.map(function (p) { return p.key; })
+};
+
+function normalizeUser(u) {
+  const user = Object.assign({}, u);
+  user.assignedBatchIds = user.assignedBatchIds || [];
+  if (user.role === 'Admin') user.permissions = ROLE_PRESETS['Admin'].slice();
+  else if (!Array.isArray(user.permissions)) user.permissions = (ROLE_PRESETS[user.role] || ROLE_PRESETS['Teacher']).slice();
+  return user;
+}
+function isAdmin() { return !!state.user && state.user.role === 'Admin'; }
+function hasPerm(p) { return isAdmin() || (!!state.user && (state.user.permissions || []).indexOf(p) !== -1); }
+
+function batchNameAny(id) {
+  const b = state.batches.concat(state.closedBatches || []).find(function (x) { return x.ID === id; });
+  return b ? b.Name + (b.Closed ? ' (Closed)' : '') : '(unassigned)';
+}
+
+/** Open batches this person can work with (marking, calling). */
+function myBatches() {
+  if (isAdmin()) return state.batches;
+  return state.batches.filter(function (b) { return state.user.assignedBatchIds.indexOf(b.ID) !== -1; });
+}
+/** For filters on Records / Reports — closed batches stay selectable so history is still reachable. */
+function filterBatches() {
+  const all = state.batches.concat(state.closedBatches || []);
+  if (isAdmin()) return all;
+  return all.filter(function (b) { return state.user.assignedBatchIds.indexOf(b.ID) !== -1; });
+}
+/** Active + discontinued students this person may look up. */
+function visibleStudents() {
+  const all = state.students.concat(state.discontinued || []);
+  if (isAdmin()) return all;
+  return all.filter(function (s) { return state.user.assignedBatchIds.indexOf(s.BatchID) !== -1; });
+}
+
+/* ================= LOGIN & SAVED SESSION ================= */
+
+const SESSION_KEY = CACHE_PREFIX + 'session';
+const VIEW_KEY = CACHE_PREFIX + 'view';
+const SESSION_MAX_AGE_MS = 30 * 24 * 3600 * 1000; // stay signed in for 30 days
+
+function saveSession_(user) {
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ user: user, savedAt: Date.now() })); } catch (e) { /* private mode — just won't persist */ }
+}
+function loadSavedSession_() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+    if (!s || !s.user || !s.user.id || Date.now() - s.savedAt > SESSION_MAX_AGE_MS) return null;
+    return s;
+  } catch (e) { return null; }
+}
 
 function renderLogin() {
   document.getElementById('app').innerHTML =
@@ -98,8 +170,8 @@ function renderLogin() {
       '<h1>' + esc(state.instituteName) + '</h1>' +
       '<p class="sub">Sign in to manage attendance</p>' +
       '<div id="loginError" class="error-text"></div>' +
-      '<div class="field"><label>Username</label><input id="loginUser" autofocus></div>' +
-      '<div class="field"><label>Password</label><input id="loginPass" type="password"></div>' +
+      '<div class="field"><label>Username</label><input id="loginUser" autocapitalize="off" autocomplete="username" autofocus></div>' +
+      '<div class="field"><label>Password</label><input id="loginPass" type="password" autocomplete="current-password"></div>' +
       '<button class="btn btn-primary" style="width:100%;justify-content:center" onclick="doLogin()">Sign in</button>' +
     '</div></div>';
   document.getElementById('loginPass').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
@@ -111,86 +183,142 @@ function doLogin() {
   if (!username || !password) return;
   gs('login', username, password).then(function (res) {
     if (res.error) { document.getElementById('loginError').textContent = res.error; return; }
-    state.user = res;
+    state.user = normalizeUser(res);
+    saveSession_(state.user);
+    try { localStorage.removeItem(VIEW_KEY); } catch (e) { }
     boot();
   }).catch(function (e) { document.getElementById('loginError').textContent = e.message || String(e); });
 }
 
-function logout() { state.user = null; renderLogin(); }
+function logout() {
+  try {
+    Object.keys(localStorage).filter(function (k) { return k.indexOf(CACHE_PREFIX) === 0; }).forEach(function (k) { localStorage.removeItem(k); });
+  } catch (e) { }
+  state.user = null;
+  renderLogin();
+}
+
+/** Page refresh: go straight back in with the saved login, then quietly re-check it with the database. */
+function restoreSession() {
+  const saved = loadSavedSession_();
+  if (!saved) { renderLogin(); return; }
+  state.user = normalizeUser(saved.user);
+  document.getElementById('app').innerHTML = '<div class="login-wrap"><div class="login-card" style="text-align:center"><h1>' + esc(state.instituteName) + '</h1><p class="sub" style="margin:0">Loading…</p></div></div>';
+  boot();
+  gs('getSessionUser', saved.user.id).then(function (res) {
+    if (!state.user) return;
+    if (res && res.error) { toast(res.error, 'error'); logout(); return; }
+    if (res && res.id) {
+      const before = JSON.stringify([state.user.role, state.user.permissions, state.user.assignedBatchIds]);
+      state.user = normalizeUser(res);
+      saveSession_(state.user);
+      if (before !== JSON.stringify([state.user.role, state.user.permissions, state.user.assignedBatchIds]) && !document.querySelector('.modal-overlay')) renderShell();
+    }
+  }).catch(function () { /* offline or old database — keep the saved login */ });
+}
 
 /* ================= BOOT + SHELL ================= */
 
+function applyBootstrap(data) {
+  state.batches = data.batches || [];
+  state.closedBatches = data.closedBatches || [];
+  state.subjects = data.subjects || [];
+  state.students = data.students || [];
+  state.discontinued = data.discontinued || [];
+}
+
 function boot() {
-  state.view = 'home';
+  let v = null;
+  try { v = localStorage.getItem(VIEW_KEY); } catch (e) { }
+  state.view = (v && canSeeNavId(v)) ? v : firstAllowedView();
   gsSWR('bootstrap', 'getBootstrapData', [], function (data) {
-    state.batches = data.batches;
-    state.subjects = data.subjects;
-    state.students = data.students;
+    applyBootstrap(data);
     state.instituteName = data.instituteName;
     state.defaulterThreshold = data.defaulterThreshold;
+    if (!state.user) return;
     if (!document.querySelector('.modal-overlay')) renderShell();
   });
 }
 
 function refreshData() {
   return gs('getBootstrapData').then(function (data) {
-    state.batches = data.batches;
-    state.subjects = data.subjects;
-    state.students = data.students;
-    const cached = getCache('bootstrap') || {};
-    setCache('bootstrap', Object.assign({}, cached, { batches: data.batches, subjects: data.subjects, students: data.students }));
+    applyBootstrap(data);
+    setCache('bootstrap', Object.assign({}, getCache('bootstrap') || {}, data));
   });
 }
 
 const NAV = [
-  { id: 'home', label: 'Dashboard', roles: ['Admin', 'Teacher'] },
-  { id: 'mark', label: 'Mark Attendance', roles: ['Admin', 'Teacher'] },
-  { id: 'records', label: 'Records', roles: ['Admin', 'Teacher'] },
-  { id: 'calling', label: 'Absentee Calling', roles: ['Admin', 'Teacher'] },
-  { id: 'reports', label: 'Reports', roles: ['Admin', 'Teacher'] },
-  { id: 'batches', label: 'Batches', roles: ['Admin'] },
-  { id: 'subjects', label: 'Subjects', roles: ['Admin'] },
-  { id: 'students', label: 'Students', roles: ['Admin'] },
-  { id: 'teachers', label: 'Teachers & Logins', roles: ['Admin'] },
-  { id: 'settings', label: 'Settings', roles: ['Admin'] }
+  { id: 'home', label: 'Dashboard', perm: 'dashboard' },
+  { id: 'mark', label: 'Mark Attendance', perm: 'mark' },
+  { id: 'records', label: 'Records', perm: 'records' },
+  { id: 'calling', label: 'Absentees Calling', perm: 'calling' },
+  { id: 'reports', label: 'Reports', perm: 'reports' },
+  { id: 'batches', label: 'Batches', perm: 'batches' },
+  { id: 'subjects', label: 'Subjects', perm: 'subjects' },
+  { id: 'students', label: 'Students', perm: 'students' },
+  { id: 'discontinued', label: 'Discontinued Students', perm: 'students' },
+  { id: 'teachers', label: 'Staff Logins', perm: '__admin' },
+  { id: 'settings', label: 'Settings', perm: '__admin' }
 ];
+function canSeeNav(n) { return n.perm === '__admin' ? isAdmin() : hasPerm(n.perm); }
+function canSeeNavId(id) { const n = NAV.find(function (x) { return x.id === id; }); return !!n && canSeeNav(n); }
+function firstAllowedView() { const n = NAV.find(canSeeNav); return n ? n.id : 'home'; }
 
 function renderShell() {
-  const navHtml = NAV.filter(function (n) { return n.roles.indexOf(state.user.role) !== -1; })
-    .map(function (n) {
-      return '<div class="nav-item' + (state.view === n.id ? ' active' : '') + '" onclick="setView(\'' + n.id + '\')">' + n.label + '</div>';
-    }).join('');
+  const navHtml = NAV.filter(canSeeNav).map(function (n) {
+    return '<div class="nav-item' + (state.view === n.id ? ' active' : '') + '" onclick="setView(\'' + n.id + '\')">' + n.label + '</div>';
+  }).join('');
 
+  document.body.classList.remove('menu-open');
   document.getElementById('app').innerHTML =
-    '<div class="sidebar">' +
-      '<div class="brand">' + esc(state.instituteName) + '<small>Attendance Manager</small></div>' +
-      navHtml +
-      '<div class="sidebar-footer">' + esc(state.user.name) + ' &middot; ' + esc(state.user.role) +
-        '<br><a class="link" style="color:#93c5fd" onclick="logout()">Sign out</a></div>' +
-    '</div>' +
+    '<div class="menu-backdrop" id="menuBackdrop" onclick="closeMenu()"></div>' +
+    '<aside class="sidebar" id="sidebar">' +
+      '<div class="sidebar-head"><div class="brand">' + esc(state.instituteName) + '<small>Attendance Manager</small></div>' +
+        '<button type="button" class="menu-close" onclick="closeMenu()" aria-label="Close menu">&times;</button></div>' +
+      '<nav class="nav-list">' + navHtml + '</nav>' +
+      '<div class="sidebar-footer"><div class="who">' + esc(state.user.name) + ' &middot; ' + esc(state.user.role) + '</div>' +
+        '<a class="link" onclick="closeMenu();openChangePassword()">Change password</a>' +
+        '<a class="link" onclick="logout()">Sign out</a></div>' +
+    '</aside>' +
     '<div class="main">' +
-      '<div class="topbar"><h2 id="viewTitle"></h2>' +
-        '<a class="link" onclick="openChangePassword()">Change password</a>' +
-      '</div>' +
+      '<header class="topbar"><h2 id="viewTitle"></h2>' +
+        '<div class="topbar-actions"><a class="link topbar-pw" onclick="openChangePassword()">Change password</a>' +
+        '<button type="button" class="menu-btn" onclick="openMenu()" aria-label="Open menu"><span></span><span></span><span></span></button></div>' +
+      '</header>' +
       '<div class="content" id="content"></div>' +
     '</div>';
   renderView();
 }
 
-function setView(v) { state.view = v; renderShell(); }
+function openMenu() {
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('menuBackdrop').classList.add('open');
+  document.body.classList.add('menu-open');
+}
+function closeMenu() {
+  const sb_ = document.getElementById('sidebar'), bd = document.getElementById('menuBackdrop');
+  if (sb_) sb_.classList.remove('open');
+  if (bd) bd.classList.remove('open');
+  document.body.classList.remove('menu-open');
+}
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeMenu(); });
 
-function renderView() {
-  const titles = { home: 'Dashboard', mark: 'Mark Attendance', records: 'Attendance Records', calling: 'Absentee Calling', reports: 'Reports',
-    batches: 'Batches', subjects: 'Subjects', students: 'Students', teachers: 'Teachers & Logins', settings: 'Settings' };
-  document.getElementById('viewTitle').textContent = titles[state.view] || '';
-  const renderers = { home: renderHome, mark: renderMark, records: renderRecords, calling: renderCalling, reports: renderReports,
-    batches: renderBatches, subjects: renderSubjects, students: renderStudents, teachers: renderTeachers, settings: renderSettings };
-  (renderers[state.view] || renderHome)();
+function setView(v) {
+  state.view = v;
+  try { localStorage.setItem(VIEW_KEY, v); } catch (e) { }
+  window.scrollTo(0, 0);
+  renderShell();
 }
 
-function myBatches() {
-  if (state.user.role === 'Admin') return state.batches;
-  return state.batches.filter(function (b) { return state.user.assignedBatchIds.indexOf(b.ID) !== -1; });
+function renderView() {
+  const titles = { home: 'Dashboard', mark: 'Mark Attendance', records: 'Attendance Records', calling: 'Absentees Calling Sheet', reports: 'Reports',
+    batches: 'Batches', subjects: 'Subjects', students: 'Students', discontinued: 'Discontinued Students', teachers: 'Staff Logins', settings: 'Settings' };
+  if (!canSeeNavId(state.view)) state.view = firstAllowedView();
+  document.getElementById('viewTitle').textContent = titles[state.view] || '';
+  if (!NAV.some(canSeeNav)) { document.getElementById('content').innerHTML = '<div class="empty-state">No access has been given to this login yet. Ask your admin.</div>'; return; }
+  const renderers = { home: renderHome, mark: renderMark, records: renderRecords, calling: renderCalling, reports: renderReports,
+    batches: renderBatches, subjects: renderSubjects, students: renderStudents, discontinued: renderDiscontinued, teachers: renderTeachers, settings: renderSettings };
+  (renderers[state.view] || renderHome)();
 }
 
 /* ================= HOME ================= */
@@ -201,20 +329,138 @@ function renderHome() {
   if (!cached) content.innerHTML = '<div class="empty-state">Loading…</div>';
   gsSWR('defaulters', 'getDefaultersReport', [{}], function (defaulters) {
     if (state.view !== 'home') return; // user already navigated away
+    const ids = myBatches().map(function (b) { return b.ID; });
+    defaulters = defaulters.filter(function (d) { return !d.discontinued && (!d.batchId || ids.indexOf(d.batchId) !== -1); });
+    const students = state.students.filter(function (s) { return ids.indexOf(s.BatchID) !== -1; });
+    const subjects = state.subjects.filter(function (s) { return ids.indexOf(s.BatchID) !== -1; });
     content.innerHTML =
       '<div class="stat-grid">' +
-        statCard(myBatches().length, 'Batches') +
-        statCard(state.students.length, 'Active students') +
-        statCard(state.subjects.length, 'Subjects') +
+        statCard(ids.length, 'Batches') +
+        statCard(students.length, 'Active students') +
+        statCard(subjects.length, 'Subjects') +
         statCard(defaulters.length, 'Students below ' + state.defaulterThreshold + '% attendance') +
       '</div>' +
       '<div class="card">' +
-        '<div class="card-header"><h3>Below-threshold students</h3><a class="link" onclick="setView(\'reports\')">Full reports →</a></div>' +
+        '<div class="card-header"><h3>Below-threshold students</h3>' + (hasPerm('reports') ? '<a class="link" onclick="setView(\'reports\')">Full reports →</a>' : '') + '</div>' +
         (defaulters.length ? renderTable(['Student', 'Roll No', 'Sessions', 'Present', '%'],
-          defaulters.slice(0, 8).map(function (d) { return [d.studentName, d.rollNo, d.totalSessions, d.present, badgePct(d.percentage)]; }))
+          defaulters.slice(0, 8).map(function (d) { return [esc(d.studentName), esc(d.rollNo), d.totalSessions, d.present, badgePct(d.percentage)]; }))
           : '<div class="empty-state">No defaulters — nice work 🎉</div>') +
       '</div>';
   });
+}
+
+/* ================= STUDENT SEARCH PICKER =================
+   Replaces the long <select> dropdowns. Type the first letters of a name (or roll no)
+   and matching students appear straight away — names starting with what you typed come first. */
+
+function byId(id) { return document.getElementById(id); }
+
+function studentPickerHtml(id, placeholder) {
+  return '<div class="picker" id="' + id + 'Wrap">' +
+    '<input type="text" id="' + id + 'Input" class="picker-input" placeholder="' + esc(placeholder || 'Type student name…') + '" autocomplete="off" autocapitalize="off" spellcheck="false">' +
+    '<button type="button" class="picker-clear" id="' + id + 'Clear" title="Clear" aria-label="Clear">&times;</button>' +
+    '<input type="hidden" id="' + id + '" value="">' +
+    '<div class="picker-list" id="' + id + 'List"></div></div>';
+}
+
+function searchStudents_(pool, q) {
+  q = q.trim().toLowerCase();
+  if (!q) return [];
+  const out = [];
+  pool.forEach(function (s) {
+    const name = String(s.Name || '').toLowerCase().replace(/\s+/g, ' ');
+    const roll = String(s.RollNo || '').toLowerCase();
+    let score = -1;
+    if (name.indexOf(q) === 0) score = 0;
+    else if (name.split(' ').some(function (w) { return w.indexOf(q) === 0; })) score = 1;
+    else if (roll.indexOf(q) === 0) score = 2;
+    else if (name.indexOf(q) !== -1) score = 3;
+    else if (roll.indexOf(q) !== -1 || String(s.Phone || '').indexOf(q) !== -1 || String(s.ParentPhone || '').indexOf(q) !== -1) score = 4;
+    if (score >= 0) out.push({ s: s, score: score, name: name });
+  });
+  out.sort(function (a, b) { return a.score - b.score || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0); });
+  return out.slice(0, 40).map(function (x) { return x.s; });
+}
+
+/** opts.getStudents() → array of students to search; opts.onChange(studentId or '') fires on pick / clear. */
+function initStudentPicker(id, opts) {
+  const input = byId(id + 'Input'), hidden = byId(id), list = byId(id + 'List'), clearBtn = byId(id + 'Clear');
+  if (!input) return;
+  let items = [], active = -1, label = '';
+
+  function close() { list.style.display = 'none'; active = -1; }
+  function show() {
+    items = searchStudents_(opts.getStudents(), input.value);
+    if (!input.value.trim()) { close(); return; }
+    list.innerHTML = items.length
+      ? items.map(function (s, i) {
+          return '<div class="picker-item" data-i="' + i + '"><span class="pi-name">' + esc(s.Name) + '</span>' +
+            '<span class="pi-meta">' + esc([s.RollNo, batchNameAny(s.BatchID), s.Discontinued ? 'Discontinued' : ''].filter(Boolean).join(' · ')) + '</span></div>';
+        }).join('')
+      : '<div class="picker-empty">No student found</div>';
+    list.style.display = 'block';
+    active = -1;
+  }
+  function highlight() {
+    Array.prototype.forEach.call(list.querySelectorAll('.picker-item'), function (el, i) {
+      el.classList.toggle('active', i === active);
+      if (i === active) el.scrollIntoView({ block: 'nearest' });
+    });
+  }
+  function choose(i) {
+    const s = items[i];
+    if (!s) return;
+    hidden.value = s.ID;
+    label = s.Name + (s.RollNo ? ' (' + s.RollNo + ')' : '');
+    input.value = label;
+    clearBtn.style.display = 'block';
+    close();
+    if (opts.onChange) opts.onChange(s.ID);
+  }
+  function clear(fire) {
+    const had = !!hidden.value;
+    hidden.value = ''; input.value = ''; label = '';
+    clearBtn.style.display = 'none';
+    close();
+    if (had && fire && opts.onChange) opts.onChange('');
+  }
+
+  input.addEventListener('input', function () {
+    if (hidden.value && input.value !== label) { hidden.value = ''; if (opts.onChange) opts.onChange(''); }
+    clearBtn.style.display = input.value ? 'block' : 'none';
+    show();
+  });
+  input.addEventListener('focus', function () { if (input.value && !hidden.value) show(); else input.select(); });
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); if (list.style.display !== 'block') show(); active = Math.min(active + 1, items.length - 1); highlight(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(active - 1, 0); highlight(); }
+    else if (e.key === 'Enter') { if (list.style.display === 'block') { e.preventDefault(); choose(active >= 0 ? active : 0); } }
+    else if (e.key === 'Escape') { close(); }
+  });
+  input.addEventListener('blur', function () {
+    setTimeout(function () { close(); if (!hidden.value && input.value) { input.value = ''; clearBtn.style.display = 'none'; } }, 180);
+  });
+  list.addEventListener('mousedown', function (e) { e.preventDefault(); }); // keep focus so the click below lands
+  list.addEventListener('click', function (e) {
+    const el = e.target.closest('.picker-item');
+    if (el) choose(Number(el.getAttribute('data-i')));
+  });
+  clearBtn.addEventListener('mousedown', function (e) { e.preventDefault(); });
+  clearBtn.addEventListener('click', function () { clear(true); input.focus(); });
+  clearBtn.style.display = 'none';
+}
+
+function setStudentPicker(id, student) {
+  byId(id).value = student.ID;
+  byId(id + 'Input').value = student.Name + (student.RollNo ? ' (' + student.RollNo + ')' : '');
+  byId(id + 'Clear').style.display = 'block';
+  // let the "typed text differs from chosen label" check treat this as the chosen label
+  byId(id + 'Input').dispatchEvent(new Event('change'));
+}
+function clearStudentPicker(id) {
+  const input = byId(id + 'Input');
+  if (!input) return;
+  byId(id).value = ''; input.value = ''; byId(id + 'Clear').style.display = 'none';
 }
 
 function statCard(num, label) {
@@ -233,95 +479,133 @@ function renderTable(headers, rows) {
 
 /* ================= MARK ATTENDANCE ================= */
 
+let sessionCtx = null; // what is on screen: batch / subject / date plus the marks loaded from the database
+let sessionToken = 0;  // so a slow answer for an old selection can't overwrite a newer one
+
 function renderMark() {
   const batches = myBatches();
   const content = document.getElementById('content');
+  sessionCtx = null;
   if (!batches.length) { content.innerHTML = '<div class="empty-state">You are not assigned to any batch yet. Ask your admin to assign one.</div>'; return; }
 
   content.innerHTML =
     '<div class="card">' +
       '<div class="filters">' +
-        '<div class="field"><label>Batch</label><select id="markBatch" onchange="onMarkBatchChange()">' +
+        '<div class="field"><label>Batch</label><select id="markBatch" onchange="onMarkBatchChange(); loadSession()">' +
           batches.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') +
         '</select></div>' +
-        '<div class="field"><label>Subject</label><select id="markSubject"></select></div>' +
-        '<div class="field"><label>Date</label><input type="date" id="markDate" value="' + todayStr() + '"></div>' +
-        '<div class="field"><button class="btn btn-primary" onclick="loadSession(this)">Load session</button></div>' +
+        '<div class="field"><label>Subject</label><select id="markSubject" onchange="loadSession()"></select></div>' +
+        '<div class="field"><label>Date</label><input type="date" id="markDate" value="' + todayStr() + '" onchange="loadSession()"></div>' +
+        '<div class="field"><button class="btn btn-secondary" onclick="loadSession(this)">Reload</button></div>' +
       '</div>' +
     '</div>' +
     '<div id="sessionArea"></div>';
   onMarkBatchChange();
+  loadSession();
 }
 
 function onMarkBatchChange() {
   const batchId = document.getElementById('markBatch').value;
   const subjects = state.subjects.filter(function (s) { return s.BatchID === batchId; });
   const sel = document.getElementById('markSubject');
-  const allOption = '<option value="__ALL__">All Subjects</option>';
-  sel.innerHTML = allOption + subjects.map(function (s) { return '<option value="' + s.ID + '">' + esc(s.Name) + '</option>'; }).join('');
-  sel.value = '__ALL__'; // always defaults here — marking one subject differently doesn't change this default
+  sel.innerHTML = '<option value="__ALL__">All Subjects</option>' + subjects.map(function (s) { return '<option value="' + s.ID + '">' + esc(s.Name) + '</option>'; }).join('');
+  sel.value = '__ALL__';
+}
+
+function subjectNameById_(id) { const s = state.subjects.find(function (x) { return x.ID === id; }); return s ? s.Name : '?'; }
+
+/** Works out what is already saved so the screen shows it (e.g. attendance that came from a bulk upload). */
+function buildSessionContext_(batchId, subjectId, date, isAll, rows) {
+  const subjectIds = state.subjects.filter(function (s) { return s.BatchID === batchId; }).map(function (s) { return s.ID; });
+  const ctx = { batchId: batchId, subjectId: subjectId, date: date, isAll: isAll, subjectIds: subjectIds, bySubject: {}, orig: {}, notes: {}, hasExisting: false };
+  const per = {};
+  rows.forEach(function (r) {
+    if (isAll && subjectIds.indexOf(r.SubjectID) === -1) return;
+    ctx.hasExisting = true;
+    (ctx.bySubject[r.SubjectID] = ctx.bySubject[r.SubjectID] || {})[r.StudentID] = r.Status;
+    (per[r.StudentID] = per[r.StudentID] || []).push({ sid: r.SubjectID, status: r.Status });
+  });
+  Object.keys(per).forEach(function (stu) {
+    const list = per[stu];
+    const has = function (st) { return list.some(function (x) { return x.status === st; }); };
+    ctx.orig[stu] = has('Absent') ? 'Absent' : has('Late') ? 'Late' : 'Present';
+    const distinct = {};
+    list.forEach(function (x) { distinct[x.status] = 1; });
+    if (isAll && Object.keys(distinct).length > 1) {
+      const parts = [];
+      ['Absent', 'Late'].forEach(function (st) {
+        const names = list.filter(function (x) { return x.status === st; }).map(function (x) { return subjectNameById_(x.sid); });
+        if (names.length) parts.push(st + ': ' + names.join(', '));
+      });
+      ctx.notes[stu] = parts.join(' · ');
+    }
+  });
+  return ctx;
 }
 
 function loadSession(btn) {
   const batchId = document.getElementById('markBatch').value;
   const subjectId = document.getElementById('markSubject').value;
   const date = document.getElementById('markDate').value;
-  if (!subjectId || !date) { toast('Pick a subject and date first', 'error'); return; }
+  if (!subjectId || !date) { if (btn) toast('Pick a subject and date first', 'error'); return; }
 
+  const area = document.getElementById('sessionArea');
   const roster = state.students.filter(function (s) { return s.BatchID === batchId; });
-  if (!roster.length) {
-    document.getElementById('sessionArea').innerHTML = '<div class="empty-state">No students in this batch yet.</div>';
-    return;
+  const token = ++sessionToken;
+  sessionCtx = null;
+  if (!roster.length) { area.innerHTML = '<div class="empty-state">No students in this batch yet.</div>'; return; }
+
+  const isAll = subjectId === '__ALL__';
+  area.innerHTML = '<div class="empty-state">Loading attendance…</div>';
+  const load = isAll
+    ? gs('getBatchDayAttendance', batchId, date)
+    : gs('getSessionAttendance', batchId, subjectId, date);
+  const task = load.then(function (rows) {
+    if (token !== sessionToken) return; // a newer selection took over
+    sessionCtx = buildSessionContext_(batchId, subjectId, date, isAll, rows);
+    renderMarkRoster(sessionCtx, roster);
+  }).catch(function (e) {
+    if (token === sessionToken) { area.innerHTML = '<div class="empty-state">Could not load attendance.</div>'; toast(e.message || String(e), 'error'); }
+  });
+  if (btn) runWithLoading(btn, 'Loading…', function () { return task; });
+}
+
+function renderMarkRoster(ctx, roster) {
+  const rows = roster.map(function (s) {
+    const status = ctx.orig[s.ID] || 'Present';
+    const searchBlob = (s.Name + ' ' + (s.RollNo || '') + ' ' + (s.Phone || '')).toLowerCase();
+    return '<div class="attendance-row" data-student="' + s.ID + '" data-search="' + esc(searchBlob) + '">' +
+      '<div>' + esc(s.Name) + (s.RollNo ? ' <span class="muted">(' + esc(s.RollNo) + ')</span>' : '') +
+        (ctx.notes[s.ID] ? '<div class="muted" style="font-size:12px">' + esc(ctx.notes[s.ID]) + '</div>' : '') + '</div>' +
+      '<div class="status-toggle">' +
+        ['Present', 'Absent', 'Late'].map(function (st) {
+          return '<button type="button" class="status-btn' + (status === st ? ' selected ' + st.toLowerCase() : '') +
+            '" onclick="setStatus(this,\'' + st + '\')" data-status="' + st + '">' + st + '</button>';
+        }).join('') +
+      '</div></div>';
+  }).join('');
+
+  const heading = ctx.isAll ? roster.length + ' students — ALL subjects' : roster.length + ' students';
+  let banner;
+  if (ctx.hasExisting) {
+    banner = ctx.isAll
+      ? 'Showing attendance already saved for ' + fmtDate(ctx.date) + ' (including bulk-uploaded data). Anyone absent in any subject shows as Absent. Change a student here and it applies to every subject held that day; students you don\'t touch keep their own per-subject marks.'
+      : 'Showing attendance already saved for this subject on ' + fmtDate(ctx.date) + '.';
+  } else {
+    banner = 'Nothing saved yet for ' + fmtDate(ctx.date) + ' — everyone starts as Present.';
   }
 
-  const isAllSubjects = subjectId === '__ALL__';
-  const renderRoster = function (existingByStudent) {
-    const rows = roster.map(function (s) {
-      const status = existingByStudent[s.ID] || 'Present';
-      const searchBlob = (s.Name + ' ' + (s.RollNo || '') + ' ' + (s.Phone || '')).toLowerCase();
-      return '<div class="attendance-row" data-student="' + s.ID + '" data-search="' + esc(searchBlob) + '">' +
-        '<div>' + esc(s.Name) + (s.RollNo ? ' <span class="muted">(' + esc(s.RollNo) + ')</span>' : '') + '</div>' +
-        '<div class="status-toggle">' +
-          ['Present', 'Absent', 'Late'].map(function (st) {
-            return '<button type="button" class="status-btn' + (status === st ? ' selected ' + st.toLowerCase() : '') +
-              '" onclick="setStatus(this,\'' + st + '\')" data-status="' + st + '">' + st + '</button>';
-          }).join('') +
-        '</div></div>';
-    }).join('');
-
-    const heading = isAllSubjects
-      ? roster.length + ' students — marking ALL subjects at once'
-      : roster.length + ' students';
-    const subNote = isAllSubjects
-      ? '<p class="muted" style="margin:-8px 0 14px">This marks every subject for this batch on this date in one go. To make one student absent in just one subject, switch Subject above to that specific subject, mark it, and save — it won\'t affect the others.</p>'
-      : '';
-
-    document.getElementById('sessionArea').innerHTML =
-      '<div class="card">' +
-        '<div class="card-header"><h3>' + heading + '</h3>' +
-          '<div><button class="btn btn-secondary btn-sm" onclick="markAll(\'Present\')">All present</button> ' +
-          '<button class="btn btn-secondary btn-sm" onclick="markAll(\'Absent\')">All absent</button></div></div>' +
-        subNote +
-        '<div class="field" style="max-width:320px"><input type="text" id="rosterSearch" placeholder="Search by name, roll no, or phone…" oninput="filterRoster()"></div>' +
-        '<div id="rosterList">' + rows + '</div>' +
-        '<div id="rosterEmpty" class="empty-state" style="display:none">No students match your search.</div>' +
-        '<div style="margin-top:16px;text-align:right"><button class="btn btn-primary" onclick="saveSession(this)">Save attendance</button></div>' +
-      '</div>';
-  };
-
-  document.getElementById('sessionArea').innerHTML = '<div class="empty-state">Loading session…</div>';
-  runWithLoading(btn, 'Loading…', function () {
-    if (isAllSubjects) {
-      // Nothing single-subject to prefill from — start everyone at Present for this fresh bulk pass.
-      renderRoster({});
-      return null;
-    }
-    return gs('getSessionAttendance', batchId, subjectId, date).then(function (existing) {
-      const existingByStudent = {};
-      existing.forEach(function (r) { existingByStudent[r.StudentID] = r.Status; });
-      renderRoster(existingByStudent);
-    });
-  });
+  document.getElementById('sessionArea').innerHTML =
+    '<div class="card">' +
+      '<div class="card-header"><h3>' + heading + '</h3>' +
+        '<div><button class="btn btn-secondary btn-sm" onclick="markAll(\'Present\')">All present</button> ' +
+        '<button class="btn btn-secondary btn-sm" onclick="markAll(\'Absent\')">All absent</button></div></div>' +
+      '<p class="muted" style="margin:-8px 0 14px">' + esc(banner) + '</p>' +
+      '<div class="field" style="max-width:320px"><input type="text" id="rosterSearch" placeholder="Search by name, roll no, or phone…" oninput="filterRoster()"></div>' +
+      '<div id="rosterList">' + rows + '</div>' +
+      '<div id="rosterEmpty" class="empty-state" style="display:none">No students match your search.</div>' +
+      '<div style="margin-top:16px;text-align:right"><button class="btn btn-primary" onclick="saveSession(this)">Save attendance</button></div>' +
+    '</div>';
 }
 
 function setStatus(btn, status) {
@@ -331,8 +615,7 @@ function setStatus(btn, status) {
 }
 function markAll(status) {
   document.querySelectorAll('.attendance-row').forEach(function (row) {
-    const btn = row.querySelector('[data-status="' + status + '"]');
-    setStatus(btn, status);
+    setStatus(row.querySelector('[data-status="' + status + '"]'), status);
   });
 }
 
@@ -350,33 +633,40 @@ function filterRoster() {
 }
 
 function saveSession(btn) {
-  const batchId = document.getElementById('markBatch').value;
-  const subjectId = document.getElementById('markSubject').value;
-  const date = document.getElementById('markDate').value;
-  const records = Array.prototype.map.call(document.querySelectorAll('.attendance-row'), function (row) {
+  const ctx = sessionCtx; // always saves what was loaded, never whatever the filters were changed to afterwards
+  if (!ctx) { toast('Load a session first', 'error'); return; }
+  const cur = {};
+  document.querySelectorAll('.attendance-row').forEach(function (row) {
     const selected = row.querySelector('.status-btn.selected');
-    return { studentId: row.getAttribute('data-student'), status: selected ? selected.getAttribute('data-status') : 'Present' };
+    cur[row.getAttribute('data-student')] = selected ? selected.getAttribute('data-status') : 'Present';
   });
+  const studentIds = Object.keys(cur);
 
-  const isAllSubjects = subjectId === '__ALL__';
-  const targetSubjectIds = isAllSubjects
-    ? state.subjects.filter(function (s) { return s.BatchID === batchId; }).map(function (s) { return s.ID; })
-    : [subjectId];
+  let targets;
+  if (!ctx.isAll) targets = [ctx.subjectId];
+  else if (!ctx.hasExisting) targets = ctx.subjectIds; // fresh day — mark every subject
+  else targets = ctx.subjectIds.filter(function (sid) { return ctx.bySubject[sid] && Object.keys(ctx.bySubject[sid]).length; }); // only classes that were actually held
+  if (!targets.length) { toast('This batch has no subjects yet — add one from Subjects first', 'error'); return; }
 
-  if (isAllSubjects && !targetSubjectIds.length) {
-    toast('This batch has no subjects yet — add one from Subjects first', 'error');
-    return;
-  }
-
-  const task = Promise.all(targetSubjectIds.map(function (sid) {
-    return gs('submitAttendance', state.user, date, batchId, sid, records);
+  const task = Promise.all(targets.map(function (sid) {
+    const records = studentIds.map(function (stu) {
+      let status = cur[stu];
+      if (ctx.isAll && ctx.hasExisting && ctx.orig[stu] === cur[stu]) {
+        const prev = (ctx.bySubject[sid] || {})[stu];
+        if (prev) status = prev; // untouched student → keep their individual mark for this subject
+      }
+      return { studentId: stu, status: status };
+    });
+    return gs('submitAttendance', state.user, ctx.date, ctx.batchId, sid, records);
   })).then(function () {
     clearAttendanceCaches();
-    toast('Attendance saved for ' + records.length + ' students' + (isAllSubjects ? ' across ' + targetSubjectIds.length + ' subjects' : ''), 'success');
+    toast('Attendance saved for ' + studentIds.length + ' students' + (ctx.isAll ? ' across ' + targets.length + ' subject(s)' : ''), 'success');
+    loadSession();
   }).catch(function (e) { toast(e.message || String(e), 'error'); });
 
   if (btn) runWithLoading(btn, 'Saving…', function () { return task; });
 }
+
 
 /** Attendance changed — any cached records/reports/home numbers are now stale. */
 function clearAttendanceCaches() {
@@ -390,32 +680,42 @@ function clearAttendanceCaches() {
 /* ================= RECORDS ================= */
 
 function renderRecords() {
-  const batches = myBatches();
+  const batches = filterBatches();
   const content = document.getElementById('content');
   content.innerHTML =
-    (state.user.role === 'Admin'
+    (hasPerm('bulk_import')
       ? '<div class="card-header" style="margin-bottom:0"><div></div><button class="btn btn-secondary btn-sm" onclick="openBulkImportAttendance()">Bulk import attendance (CSV)</button></div>'
       : '') +
     '<div class="card">' +
       '<div class="filters">' +
-        '<div class="field"><label>Batch</label><select id="recBatch"><option value="">All</option>' +
+        '<div class="field"><label>Batch</label><select id="recBatch" onchange="clearStudentPicker(\'recStudent\')"><option value="">All</option>' +
           batches.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') + '</select></div>' +
-        '<div class="field"><label>Student</label><select id="recStudent"><option value="">All</option>' +
-          state.students.map(function (s) { return '<option value="' + s.ID + '">' + esc(s.Name) + '</option>'; }).join('') + '</select></div>' +
+        '<div class="field"><label>Student</label>' + studentPickerHtml('recStudent', 'All students — type a name…') + '</div>' +
         '<div class="field"><label>From</label><input type="date" id="recFrom"></div>' +
         '<div class="field"><label>To</label><input type="date" id="recTo"></div>' +
         '<div class="field"><button class="btn btn-primary" onclick="loadRecords()">Filter</button></div>' +
       '</div>' +
       '<div class="flex-between"><div id="recCount" class="muted"></div>' +
-        '<div class="export-row">' +
-          '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'csv\')">Export CSV</button>' +
-          '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'xlsx\')">Export Excel</button>' +
-          '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'pdf\')">Export PDF</button>' +
-        '</div>' +
+        exportRowHtml() +
       '</div>' +
       '<div id="recTable" style="margin-top:12px"></div>' +
     '</div>';
+  initStudentPicker('recStudent', {
+    getStudents: function () {
+      const b = byId('recBatch').value;
+      return visibleStudents().filter(function (s) { return !b || s.BatchID === b; });
+    },
+    onChange: function () { loadRecords(); }
+  });
   loadRecords();
+}
+
+function exportRowHtml() {
+  if (!hasPerm('export')) return '';
+  return '<div class="export-row">' +
+    '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'csv\')">Export CSV</button>' +
+    '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'xlsx\')">Export Excel</button>' +
+    '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'pdf\')">Export PDF</button></div>';
 }
 
 let lastExportData = null; // { title, headers, rows, loadAll? } — loadAll fetches every matching row for export
@@ -432,7 +732,7 @@ function loadRecords() {
     to: document.getElementById('recTo').value
   };
   // Teachers only ever see their own batches, even with "All" selected.
-  if (state.user.role !== 'Admin' && !filters.batchId) filters.batchIds = myBatches().map(function (b) { return b.ID; });
+  if (!isAdmin() && !filters.batchId) filters.batchIds = filterBatches().map(function (b) { return b.ID; });
 
   const cacheKey = 'records:' + JSON.stringify(filters);
   if (!getCache(cacheKey)) document.getElementById('recTable').innerHTML = '<div class="empty-state">Loading…</div>';
@@ -477,7 +777,10 @@ function statusBadge(status) {
   return '<span class="badge ' + cls + '">' + esc(status) + '</span>';
 }
 
+
 /* ================= ABSENTEE CALLING ================= */
+
+let callToken = 0;
 
 function renderCalling() {
   const batches = myBatches();
@@ -486,32 +789,40 @@ function renderCalling() {
   content.innerHTML =
     '<div class="card">' +
       '<div class="filters">' +
-        '<div class="field"><label>Batch</label><select id="callBatch">' +
+        '<div class="field"><label>Batch</label><select id="callBatch" onchange="loadAbsentees()">' +
           batches.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') +
         '</select></div>' +
-        '<div class="field"><label>Date</label><input type="date" id="callDate" value="' + todayStr() + '"></div>' +
-        '<div class="field"><button class="btn btn-primary" onclick="loadAbsentees(this)">Load absentees</button></div>' +
+        '<div class="field"><label>Date</label><input type="date" id="callDate" value="' + todayStr() + '" onchange="loadAbsentees()"></div>' +
+        '<div class="field"><button class="btn btn-secondary" onclick="loadAbsentees(this)">Reload</button></div>' +
       '</div>' +
     '</div>' +
     '<div id="callingArea"></div>';
+  loadAbsentees();
 }
 
 function loadAbsentees(btn) {
   const batchId = document.getElementById('callBatch').value;
   const date = document.getElementById('callDate').value;
-  if (!batchId || !date) { toast('Pick a batch and date first', 'error'); return; }
+  if (!batchId || !date) { if (btn) toast('Pick a batch and date first', 'error'); return; }
+  const token = ++callToken;
   document.getElementById('callingArea').innerHTML = '<div class="empty-state">Loading…</div>';
-  runWithLoading(btn, 'Loading…', function () {
-    return gs('getAbsenteesForDate', batchId, date).then(function (absentees) {
-      renderAbsenteeList(absentees, batchId, date);
-    });
+  const task = gs('getAbsenteesForDate', batchId, date).then(function (res) {
+    if (token !== callToken) return;
+    renderAbsenteeList(res, batchId, date);
+  }).catch(function (e) {
+    if (token === callToken) { document.getElementById('callingArea').innerHTML = ''; toast(e.message || String(e), 'error'); }
   });
+  if (btn) runWithLoading(btn, 'Loading…', function () { return task; });
 }
 
-function renderAbsenteeList(absentees, batchId, date) {
+function renderAbsenteeList(res, batchId, date) {
   const area = document.getElementById('callingArea');
+  const absentees = res.absentees;
   if (!absentees.length) {
-    area.innerHTML = '<div class="empty-state">No absentees for this batch on ' + fmtDate(date) + ' 🎉</div>';
+    area.innerHTML = res.totalMarked
+      ? '<div class="empty-state">No absentees for this batch on ' + fmtDate(date) + ' 🎉</div>'
+      : '<div class="empty-state">No attendance has been marked for this batch on ' + fmtDate(date) + '.<br>' +
+        '<span style="font-size:12.5px">If you uploaded this date from a CSV, check that you picked the same batch name that was written in the CSV.</span></div>';
     return;
   }
   const colors = [
@@ -605,7 +916,7 @@ function downloadBase64(base64, mimeType, filename) {
 /* ================= REPORTS ================= */
 
 function renderReports() {
-  const batches = myBatches();
+  const batches = filterBatches();
   const content = document.getElementById('content');
   content.innerHTML =
     '<div class="card">' +
@@ -618,20 +929,21 @@ function renderReports() {
         '</select></div>' +
         '<div class="field" id="repBatchWrap"><label>Batch</label><select id="repBatch" onchange="loadReport()"><option value="">All</option>' +
           batches.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') + '</select></div>' +
-        '<div class="field" id="repStudentWrap" style="display:none"><label>Student</label><select id="repStudent" onchange="loadReport()">' +
-          state.students.map(function (s) { return '<option value="' + s.ID + '">' + esc(s.Name) + (s.RollNo ? ' (' + esc(s.RollNo) + ')' : '') + '</option>'; }).join('') + '</select></div>' +
+        '<div class="field" id="repStudentWrap" style="display:none"><label>Student</label>' + studentPickerHtml('repStudent', 'Type student name…') + '</div>' +
         '<div class="field"><label>From</label><input type="date" id="repFrom" onchange="loadReport()"></div>' +
         '<div class="field"><label>To</label><input type="date" id="repTo" onchange="loadReport()"></div>' +
       '</div>' +
       '<div class="flex-between"><div id="repCount" class="muted"></div>' +
-        '<div class="export-row">' +
-          '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'csv\')">Export CSV</button>' +
-          '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'xlsx\')">Export Excel</button>' +
-          '<button class="btn btn-secondary btn-sm" onclick="exportCurrent(\'pdf\')">Export PDF</button>' +
-        '</div>' +
+        exportRowHtml() +
       '</div>' +
       '<div id="repTable" style="margin-top:12px"></div>' +
     '</div>';
+  initStudentPicker('repStudent', { getStudents: visibleStudents, onChange: function () { loadReport(); } });
+  if (pendingReportStudent) {
+    const st = visibleStudents().find(function (x) { return x.ID === pendingReportStudent; });
+    pendingReportStudent = null;
+    if (st) { byId('repType').value = 'card'; toggleReportFilters(); setStudentPicker('repStudent', st); }
+  }
   loadReport();
 }
 
@@ -651,7 +963,11 @@ function loadReport() {
 
   if (type === 'card') {
     const studentId = document.getElementById('repStudent').value;
-    if (!studentId) { document.getElementById('repTable').innerHTML = '<div class="empty-state">No students yet — add one from Students first.</div>'; return; }
+    if (!studentId) {
+      document.getElementById('repCount').textContent = '';
+      document.getElementById('repTable').innerHTML = '<div class="empty-state">Type a student\'s name above and pick them to see the report card.</div>';
+      return;
+    }
     const cacheKey = 'report:card:' + studentId + ':' + JSON.stringify(filters);
     if (!getCache(cacheKey)) document.getElementById('repTable').innerHTML = '<div class="empty-state">Loading…</div>';
     gsSWR(cacheKey, 'getStudentReportCard', [studentId, filters], function (data) {
@@ -714,23 +1030,34 @@ function renderReportCard(data) {
       : '<div class="empty-state">No attendance records in this range yet.</div>');
 }
 
-/* ================= BATCHES (admin) ================= */
+/* ================= BATCHES ================= */
 
 function renderBatches() {
   const content = document.getElementById('content');
+  const countFor = function (id) { return state.students.filter(function (s) { return s.BatchID === id; }).length; };
+  const closed = state.closedBatches || [];
   content.innerHTML =
     '<div class="card">' +
       '<div class="card-header"><h3>Batches</h3><button class="btn btn-primary btn-sm" onclick="openBatchModal()">+ Add batch</button></div>' +
-      renderTable(['Name', 'Description', ''], state.batches.map(function (b) {
-        return [esc(b.Name), esc(b.Description || ''),
+      (state.batches.length ? renderTable(['Name', 'Description', 'Students', ''], state.batches.map(function (b) {
+        return [esc(b.Name), esc(b.Description || ''), countFor(b.ID),
           '<a class="link" onclick=\'openBatchModal(' + JSON.stringify(b.ID) + ')\'>Edit</a> &nbsp; ' +
+          '<a class="link" style="color:#d97706" onclick="closeBatchConfirm(this,\'' + b.ID + '\')">Close</a> &nbsp; ' +
           '<a class="link" style="color:#dc2626" onclick="deleteBatchConfirm(this,\'' + b.ID + '\')">Delete</a>'];
-      })) +
-    '</div>';
+      })) : '<div class="empty-state">No open batches.</div>') +
+    '</div>' +
+    (closed.length ?
+      '<div class="card"><div class="card-header"><h3>Closed batches</h3></div>' +
+        '<p class="muted" style="margin-top:-6px">Closed batches are hidden from Mark Attendance and Absentees Calling. Their students and attendance history are kept.</p>' +
+        renderTable(['Name', 'Description', 'Closed on', ''], closed.map(function (b) {
+          return [esc(b.Name), esc(b.Description || ''), b.ClosedAt ? fmtDate(b.ClosedAt) : '—',
+            '<a class="link" onclick="restoreBatchConfirm(this,\'' + b.ID + '\')">Restore</a> &nbsp; ' +
+            '<a class="link" style="color:#dc2626" onclick="deleteBatchConfirm(this,\'' + b.ID + '\')">Delete</a>'];
+        })) + '</div>' : '');
 }
 
 function openBatchModal(id) {
-  const batch = id ? state.batches.find(function (b) { return b.ID === id; }) : null;
+  const batch = id ? state.batches.concat(state.closedBatches || []).find(function (b) { return b.ID === id; }) : null;
   showModal('batchModal', (batch ? 'Edit' : 'Add') + ' batch',
     '<div class="field"><label>Name</label><input id="bName" value="' + esc(batch ? batch.Name : '') + '"></div>' +
     '<div class="field"><label>Description</label><textarea id="bDesc" rows="2">' + esc(batch ? batch.Description : '') + '</textarea></div>',
@@ -741,17 +1068,31 @@ function openBatchModal(id) {
       return call.then(function () { closeModal(); return refreshData(); }).then(function () { renderBatches(); toast('Saved', 'success'); });
     });
 }
+function closeBatchConfirm(el, id) {
+  if (!confirm('Close this batch?\n\nIt will disappear from Mark Attendance and Absentees Calling. Students and all attendance history are kept, and you can restore it any time.')) return;
+  runWithLoading(el, 'Closing…', function () {
+    return gs('closeBatch', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderBatches(); toast('Batch closed', 'success'); })
+      .catch(function (e) { toast(e.message || String(e), 'error'); });
+  });
+}
+function restoreBatchConfirm(el, id) {
+  runWithLoading(el, 'Restoring…', function () {
+    return gs('restoreBatch', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderBatches(); toast('Batch restored', 'success'); })
+      .catch(function (e) { toast(e.message || String(e), 'error'); });
+  });
+}
 function deleteBatchConfirm(el, id) {
-  if (!confirm('Delete this batch? Students/subjects in it will remain but be unassigned.')) return;
+  if (!confirm('Delete this batch? Students/subjects in it will remain but be unassigned. (To keep it for later, use Close instead.)')) return;
   runWithLoading(el, 'Deleting…', function () {
-    return gs('deleteBatch', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderBatches(); toast('Deleted', 'success'); });
+    return gs('deleteBatch', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderBatches(); toast('Deleted', 'success'); })
+      .catch(function (e) { toast(e.message || String(e), 'error'); });
   });
 }
 
 /* ================= SUBJECTS (admin) ================= */
 
 function renderSubjects() {
-  const batchName = function (id) { const b = state.batches.find(function (x) { return x.ID === id; }); return b ? b.Name : '(unassigned)'; };
+  const batchName = batchNameAny;
   const content = document.getElementById('content');
   content.innerHTML =
     '<div class="card">' +
@@ -784,14 +1125,14 @@ function deleteSubjectConfirm(el, id) {
   });
 }
 
-/* ================= STUDENTS (admin) ================= */
+/* ================= STUDENTS ================= */
 
 function renderStudents() {
   const content = document.getElementById('content');
   content.innerHTML =
     '<div class="card">' +
       '<div class="card-header"><h3>Students</h3><div>' +
-        '<button class="btn btn-secondary btn-sm" onclick="openBulkImport()">Bulk import</button> ' +
+        (hasPerm('bulk_import') ? '<button class="btn btn-secondary btn-sm" onclick="openBulkImport()">Bulk import</button> ' : '') +
         '<button class="btn btn-primary btn-sm" onclick="openStudentModal()">+ Add student</button></div></div>' +
       '<div class="field" style="max-width:320px"><input type="text" id="studentSearch" placeholder="Search by name, roll no, or phone…" oninput="renderStudentsTable()"></div>' +
       '<div id="studentsTableArea"></div>' +
@@ -799,7 +1140,6 @@ function renderStudents() {
   renderStudentsTable();
 }
 function renderStudentsTable() {
-  const batchName = function (id) { const b = state.batches.find(function (x) { return x.ID === id; }); return b ? b.Name : '(unassigned)'; };
   const q = (document.getElementById('studentSearch').value || '').trim().toLowerCase();
   const filtered = !q ? state.students : state.students.filter(function (s) {
     return String(s.Name || '').toLowerCase().indexOf(q) !== -1 ||
@@ -809,21 +1149,24 @@ function renderStudentsTable() {
   });
   document.getElementById('studentsTableArea').innerHTML = filtered.length
     ? renderTable(['Name', 'Roll No', 'Batch', 'Phone', 'Parent Phone', ''], filtered.map(function (s) {
-        return [esc(s.Name), esc(s.RollNo || ''), esc(batchName(s.BatchID)), esc(s.Phone || ''), esc(s.ParentPhone || ''),
+        return [esc(s.Name), esc(s.RollNo || ''), esc(batchNameAny(s.BatchID)), esc(s.Phone || ''), esc(s.ParentPhone || ''),
           '<a class="link" onclick=\'openStudentModal(' + JSON.stringify(s.ID) + ')\'>Edit</a> &nbsp; ' +
+          '<a class="link" style="color:#d97706" onclick=\'openDiscontinueModal(' + JSON.stringify(s.ID) + ')\'>Discontinue</a> &nbsp; ' +
           '<a class="link" style="color:#dc2626" onclick="deleteStudentConfirm(this,\'' + s.ID + '\')">Delete</a>'];
       }))
     : '<div class="empty-state">No students match "' + esc(q) + '".</div>';
 }
 function openStudentModal(id) {
   const student = id ? state.students.find(function (s) { return s.ID === id; }) : null;
+  const batchOpts = state.batches.concat(student && !state.batches.some(function (b) { return b.ID === student.BatchID; })
+    ? (state.closedBatches || []).filter(function (b) { return b.ID === student.BatchID; }) : []);
   showModal('studentModal', (student ? 'Edit' : 'Add') + ' student',
     '<div class="field-row">' +
       '<div class="field"><label>Name</label><input id="stName" value="' + esc(student ? student.Name : '') + '"></div>' +
       '<div class="field"><label>Roll No</label><input id="stRoll" value="' + esc(student ? student.RollNo : '') + '"></div>' +
     '</div>' +
     '<div class="field"><label>Batch</label><select id="stBatch">' +
-      state.batches.map(function (b) { return '<option value="' + b.ID + '"' + (student && student.BatchID === b.ID ? ' selected' : '') + '>' + esc(b.Name) + '</option>'; }).join('') +
+      batchOpts.map(function (b) { return '<option value="' + b.ID + '"' + (student && student.BatchID === b.ID ? ' selected' : '') + '>' + esc(b.Name) + (b.Closed ? ' (Closed)' : '') + '</option>'; }).join('') +
     '</select></div>' +
     '<div class="field-row">' +
       '<div class="field"><label>Phone (student)</label><input id="stPhone" value="' + esc(student ? student.Phone : '') + '"></div>' +
@@ -841,15 +1184,70 @@ function openStudentModal(id) {
       };
       if (!data.name) { toast('Name is required', 'error'); return; }
       const call = student ? gs('updateStudent', state.user.role, Object.assign({ id: student.ID }, data)) : gs('createStudent', state.user.role, data);
-      return call.then(function () { closeModal(); return refreshData(); }).then(function () { renderStudents(); toast('Saved', 'success'); });
+      return call.then(function () { closeModal(); return refreshData(); }).then(function () { renderStudents(); toast('Saved', 'success'); })
+        .catch(function (e) { toast(e.message || String(e), 'error'); });
     });
 }
+function openDiscontinueModal(id) {
+  const s = state.students.find(function (x) { return x.ID === id; });
+  if (!s) return;
+  showModal('discModal', 'Discontinue student',
+    '<p style="margin-top:0"><strong>' + esc(s.Name) + '</strong>' + (s.RollNo ? ' (' + esc(s.RollNo) + ')' : '') + ' will move to the <em>Discontinued Students</em> page and will no longer appear in attendance sheets. Past attendance is kept, and you can restore the student any time.</p>' +
+    '<div class="field"><label>Reason (optional)</label><input id="discReason" placeholder="e.g. Left the institute, fee not paid, shifted city"></div>',
+    function () {
+      const reason = document.getElementById('discReason').value.trim();
+      return gs('discontinueStudent', state.user.role, id, reason)
+        .then(function () { closeModal(); return refreshData(); })
+        .then(function () { clearAttendanceCaches(); renderStudents(); toast('Student discontinued', 'success'); })
+        .catch(function (e) { toast(e.message || String(e), 'error'); });
+    }, 'Discontinue');
+}
 function deleteStudentConfirm(el, id) {
-  if (!confirm('Delete this student? Their past attendance history is kept.')) return;
+  if (!confirm('Delete this student? Their past attendance history is kept. (To keep the student on file, use Discontinue instead.)')) return;
   runWithLoading(el, 'Deleting…', function () {
-    return gs('deleteStudent', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderStudents(); toast('Deleted', 'success'); });
+    return gs('deleteStudent', state.user.role, id).then(function () { return refreshData(); }).then(function () { renderStudents(); toast('Deleted', 'success'); })
+      .catch(function (e) { toast(e.message || String(e), 'error'); });
   });
 }
+
+/* ================= DISCONTINUED STUDENTS ================= */
+
+function renderDiscontinued() {
+  const content = document.getElementById('content');
+  content.innerHTML =
+    '<div class="card">' +
+      '<div class="card-header"><h3>Discontinued students (' + (state.discontinued || []).length + ')</h3></div>' +
+      '<div class="field" style="max-width:320px"><input type="text" id="discSearch" placeholder="Search by name, roll no, or phone…" oninput="renderDiscontinuedTable()"></div>' +
+      '<div id="discTableArea"></div>' +
+    '</div>';
+  renderDiscontinuedTable();
+}
+function renderDiscontinuedTable() {
+  const q = (document.getElementById('discSearch').value || '').trim().toLowerCase();
+  const all = state.discontinued || [];
+  const filtered = !q ? all : all.filter(function (s) {
+    return [s.Name, s.RollNo, s.Phone, s.ParentPhone].some(function (v) { return String(v || '').toLowerCase().indexOf(q) !== -1; });
+  });
+  document.getElementById('discTableArea').innerHTML = filtered.length
+    ? renderTable(['Name', 'Roll No', 'Batch', 'Phone', 'Parent Phone', 'Discontinued on', 'Reason', ''], filtered.map(function (s) {
+        return [esc(s.Name), esc(s.RollNo || ''), esc(batchNameAny(s.BatchID)), esc(s.Phone || ''), esc(s.ParentPhone || ''),
+          s.DiscontinuedAt ? fmtDate(s.DiscontinuedAt) : '—', s.DiscontinueReason ? esc(s.DiscontinueReason) : '<span class="muted">—</span>',
+          (hasPerm('reports') ? '<a class="link" onclick="viewStudentCard(\'' + s.ID + '\')">Report card</a> &nbsp; ' : '') +
+          '<a class="link" style="color:#16a34a" onclick="restoreStudentConfirm(this,\'' + s.ID + '\')">Restore</a>'];
+      }))
+    : '<div class="empty-state">' + (q ? 'No discontinued students match "' + esc(q) + '".' : 'No discontinued students.') + '</div>';
+}
+function restoreStudentConfirm(el, id) {
+  if (!confirm('Restore this student? They will appear in their batch\'s attendance sheet again.')) return;
+  runWithLoading(el, 'Restoring…', function () {
+    return gs('restoreStudent', state.user.role, id).then(function () { return refreshData(); })
+      .then(function () { clearAttendanceCaches(); renderDiscontinued(); toast('Student restored', 'success'); })
+      .catch(function (e) { toast(e.message || String(e), 'error'); });
+  });
+}
+let pendingReportStudent = null;
+function viewStudentCard(id) { pendingReportStudent = id; setView('reports'); }
+
 function openBulkImport() {
   showModal('bulkModal', 'Bulk import students',
     '<div class="field"><label>Batch</label><select id="biBatch">' +
@@ -997,7 +1395,7 @@ function downloadSampleAttendanceCsv() {
   downloadBase64(btoa(unescape(encodeURIComponent(csv))), 'text/csv', 'attendance_history_sample.csv');
 }
 
-/* ================= TEACHERS & LOGINS (admin) ================= */
+/* ================= STAFF LOGINS (admin) ================= */
 
 function renderTeachers() {
   const content = document.getElementById('content');
@@ -1005,12 +1403,15 @@ function renderTeachers() {
   if (!cached) content.innerHTML = '<div class="card"><div class="empty-state">Loading…</div></div>';
   gsSWR('users', 'listUsers', [state.user.role], function (users) {
     if (state.view !== 'teachers') return;
-    const batchNames = function (ids) { return ids.map(function (id) { const b = state.batches.find(function (x) { return x.ID === id; }); return b ? b.Name : ''; }).filter(Boolean).join(', ') || '—'; };
+    const batchNames = function (ids) { return (ids || []).map(function (id) { return batchNameAny(id); }).filter(function (n) { return n !== '(unassigned)'; }).join(', ') || '—'; };
     content.innerHTML =
       '<div class="card">' +
-        '<div class="card-header"><h3>Teachers &amp; logins</h3><button class="btn btn-primary btn-sm" onclick="openUserModal()">+ Add login</button></div>' +
-        renderTable(['Name', 'Username', 'Role', 'Assigned batches', 'Status', ''], users.map(function (u) {
-          return [esc(u.name), esc(u.username), esc(u.role), esc(batchNames(u.assignedBatchIds)),
+        '<div class="card-header"><h3>Staff logins</h3><button class="btn btn-primary btn-sm" onclick="openUserModal()">+ Add login</button></div>' +
+        renderTable(['Name', 'Username', 'Role', 'Access', 'Assigned batches', 'Status', ''], users.map(function (u) {
+          const access = u.role === 'Admin' ? 'Full access'
+            : (u.permissions || []).map(function (k) { const p = PERMISSIONS.find(function (x) { return x.key === k; }); return p ? p.label.replace(/ \(.*\)/, '') : k; }).join(', ') || '—';
+          return [esc(u.name), esc(u.username), esc(u.role), '<span style="font-size:12.5px">' + esc(access) + '</span>',
+            u.role === 'Admin' ? '<span class="muted">All</span>' : esc(batchNames(u.assignedBatchIds)),
             u.active ? '<span class="badge badge-success">Active</span>' : '<span class="badge badge-neutral">Disabled</span>',
             '<a class="link" onclick=\'openUserModal(' + JSON.stringify(u.id) + ')\'>Edit</a> &nbsp; ' +
             (u.username !== 'admin' ? '<a class="link" style="color:#dc2626" onclick="deleteUserConfirm(this,\'' + u.id + '\')">Delete</a>' : '')];
@@ -1018,56 +1419,80 @@ function renderTeachers() {
       '</div>';
   });
 }
+
 function openUserModal(id) {
   gs('listUsers', state.user.role).then(function (users) {
     const u = id ? users.find(function (x) { return x.id === id; }) : null;
+    const startRole = u ? u.role : 'Teacher';
+    const startPerms = u ? (u.role === 'Admin' ? [] : (u.permissions || [])) : ROLE_PRESETS[startRole];
+    const batches = state.batches.concat(state.closedBatches || []);
     showModal('userModal', (u ? 'Edit' : 'Add') + ' login',
       '<div class="field"><label>Name</label><input id="uName" value="' + esc(u ? u.name : '') + '"></div>' +
-      '<div class="field"><label>Username</label><input id="uUsername" value="' + esc(u ? u.username : '') + '"' + (u ? ' disabled' : '') + '></div>' +
-      '<div class="field"><label>' + (u ? 'New password (leave blank to keep current)' : 'Password') + '</label><input id="uPassword" type="password"></div>' +
-      '<div class="field"><label>Role</label><select id="uRole" onchange="toggleBatchPicker()">' +
-        '<option value="Teacher"' + (u && u.role === 'Teacher' ? ' selected' : '') + '>Teacher</option>' +
-        '<option value="Admin"' + (u && u.role === 'Admin' ? ' selected' : '') + '>Admin</option>' +
+      '<div class="field"><label>Username</label><input id="uUsername" autocapitalize="off" value="' + esc(u ? u.username : '') + '"' + (u ? ' disabled' : '') + '></div>' +
+      '<div class="field"><label>' + (u ? 'New password (leave blank to keep current)' : 'Password') + '</label><input id="uPassword" type="password" autocomplete="new-password"></div>' +
+      '<div class="field"><label>Role</label><select id="uRole" onchange="onUserRoleChange()">' +
+        ROLES.map(function (r) { return '<option value="' + r + '"' + (r === startRole ? ' selected' : '') + '>' + r + '</option>'; }).join('') +
       '</select></div>' +
-      '<div class="field" id="batchPickerWrap"><label>Assigned batches (teachers only)</label>' +
-        state.batches.map(function (b) {
-          const checked = u && u.assignedBatchIds.indexOf(b.ID) !== -1;
-          return '<label style="font-weight:400;display:flex;gap:6px;align-items:center;margin-bottom:4px">' +
-            '<input type="checkbox" class="batchCheck" value="' + b.ID + '"' + (checked ? ' checked' : '') + '> ' + esc(b.Name) + '</label>';
+      '<div class="field" id="permWrap"><label>What can this login access? (tick / untick anything)</label>' +
+        PERMISSIONS.map(function (p) {
+          return '<label class="check-row"><input type="checkbox" class="permCheck" value="' + p.key + '"' + (startPerms.indexOf(p.key) !== -1 ? ' checked' : '') + '> ' + esc(p.label) + '</label>';
         }).join('') +
-      '</div>',
+      '</div>' +
+      '<div class="field" id="batchPickerWrap"><label>Batches this login can work with</label>' +
+        (batches.length ? batches.map(function (b) {
+          const checked = u && (u.assignedBatchIds || []).indexOf(b.ID) !== -1;
+          return '<label class="check-row"><input type="checkbox" class="batchCheck" value="' + b.ID + '"' + (checked ? ' checked' : '') + '> ' + esc(b.Name) + (b.Closed ? ' (Closed)' : '') + '</label>';
+        }).join('') : '<span class="muted">No batches yet.</span>') +
+      '</div>' +
+      '<div id="adminNote" class="muted" style="display:none">Admin always has full access to everything, including all batches.</div>' +
+      (u ? '<label class="check-row" style="margin-top:10px"><input type="checkbox" id="uActive"' + (u.active ? ' checked' : '') + '> Login enabled</label>' : ''),
       function () {
         const assignedBatchIds = Array.prototype.map.call(document.querySelectorAll('.batchCheck:checked'), function (c) { return c.value; });
         const role = document.getElementById('uRole').value;
         const password = document.getElementById('uPassword').value;
+        const permissions = role === 'Admin' ? ROLE_PRESETS['Admin'] : Array.prototype.map.call(document.querySelectorAll('.permCheck:checked'), function (c) { return c.value; });
+        if (role !== 'Admin' && !permissions.length) { toast('Tick at least one thing this login can access', 'error'); return; }
+        if (u && u.id === state.user.id && role !== 'Admin') { toast('You can\'t remove your own Admin role', 'error'); return; }
         if (u) {
-          return gs('updateUser', state.user.role, { id: u.id, name: document.getElementById('uName').value.trim(), role: role, assignedBatchIds: assignedBatchIds, newPassword: password || null })
-            .then(function (res) { finishUserSave(res); });
-        } else {
-          const name = document.getElementById('uName').value.trim();
-          const username = document.getElementById('uUsername').value.trim();
-          if (!name || !username || !password) { toast('Name, username, and password are required', 'error'); return; }
-          return gs('createUser', state.user.role, { name: name, username: username, password: password, role: role, assignedBatchIds: assignedBatchIds })
-            .then(function (res) { finishUserSave(res); });
+          const activeBox = document.getElementById('uActive');
+          return gs('updateUser', state.user.role, { id: u.id, name: document.getElementById('uName').value.trim(), role: role, assignedBatchIds: assignedBatchIds,
+              permissions: permissions, active: activeBox ? activeBox.checked : null, newPassword: password || null })
+            .then(function (res) { finishUserSave(res); }).catch(function (e) { toast(e.message || String(e), 'error'); });
         }
+        const name = document.getElementById('uName').value.trim();
+        const username = document.getElementById('uUsername').value.trim();
+        if (!name || !username || !password) { toast('Name, username, and password are required', 'error'); return; }
+        return gs('createUser', state.user.role, { name: name, username: username, password: password, role: role, assignedBatchIds: assignedBatchIds, permissions: permissions })
+          .then(function (res) { finishUserSave(res); }).catch(function (e) { toast(e.message || String(e), 'error'); });
       });
-    toggleBatchPicker();
-  });
+    toggleUserSections();
+  }).catch(function (e) { toast(e.message || String(e), 'error'); });
+}
+/** Picking a role pre-ticks that role's usual access — the admin then adjusts it as needed. */
+function onUserRoleChange() {
+  const role = document.getElementById('uRole').value;
+  const preset = ROLE_PRESETS[role] || [];
+  document.querySelectorAll('.permCheck').forEach(function (c) { c.checked = preset.indexOf(c.value) !== -1; });
+  toggleUserSections();
+}
+function toggleUserSections() {
+  const isAdminRole = document.getElementById('uRole').value === 'Admin';
+  document.getElementById('permWrap').style.display = isAdminRole ? 'none' : 'block';
+  document.getElementById('batchPickerWrap').style.display = isAdminRole ? 'none' : 'block';
+  document.getElementById('adminNote').style.display = isAdminRole ? 'block' : 'none';
 }
 function finishUserSave(res) {
   if (res.error) { toast(res.error, 'error'); return; }
+  try { localStorage.removeItem(CACHE_PREFIX + 'users'); } catch (e) { }
   closeModal(); renderTeachers(); toast('Saved', 'success');
-}
-function toggleBatchPicker() {
-  const role = document.getElementById('uRole').value;
-  document.getElementById('batchPickerWrap').style.display = role === 'Admin' ? 'none' : 'block';
 }
 function deleteUserConfirm(el, id) {
   if (!confirm('Delete this login?')) return;
   runWithLoading(el, 'Deleting…', function () {
-    return gs('deleteUser', state.user.role, id).then(function () { renderTeachers(); toast('Deleted', 'success'); });
+    return gs('deleteUser', state.user.role, id).then(function () { try { localStorage.removeItem(CACHE_PREFIX + 'users'); } catch (e) { } renderTeachers(); toast('Deleted', 'success'); });
   });
 }
+
 
 /* ================= SETTINGS (admin) ================= */
 
@@ -1107,7 +1532,7 @@ function openChangePassword() {
 
 /* ================= MODAL HELPER ================= */
 
-function showModal(id, title, bodyHtml, onSave) {
+function showModal(id, title, bodyHtml, onSave, saveLabel) {
   closeModal();
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
@@ -1115,7 +1540,7 @@ function showModal(id, title, bodyHtml, onSave) {
   overlay.innerHTML =
     '<div class="modal"><h3>' + esc(title) + '</h3><div id="modalBody">' + bodyHtml + '</div>' +
       '<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">Cancel</button>' +
-      '<button class="btn btn-primary" id="modalSaveBtn">Save</button></div></div>';
+      '<button class="btn btn-primary" id="modalSaveBtn">' + esc(saveLabel || 'Save') + '</button></div></div>';
   document.body.appendChild(overlay);
   document.getElementById('modalSaveBtn').addEventListener('click', function () {
     runWithLoading(document.getElementById('modalSaveBtn'), 'Saving…', onSave);
@@ -1127,4 +1552,4 @@ function closeModal() {
 
 /* ================= START ================= */
 
-renderLogin();
+restoreSession();
