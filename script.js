@@ -564,6 +564,7 @@ function renderMark() {
     '<div id="sessionArea"></div>';
   onMarkBatchChange();
   loadSession();
+  syncHighlights();
 }
 
 function onMarkBatchChange() {
@@ -659,11 +660,11 @@ function renderMarkRoster(ctx, roster) {
   const rows = roster.map(function (s) {
     const status = ctx.orig[s.ID] || ''; // nothing is assumed — unmarked stays unmarked
     const searchBlob = (s.Name + ' ' + (s.RollNo || '') + ' ' + (s.Phone || '')).toLowerCase();
-    return '<div class="attendance-row' + (status ? '' : ' unmarked') + '" data-student="' + s.ID + '" data-search="' + esc(searchBlob) + '">' +
+    return '<div class="attendance-row' + (status ? '' : ' unmarked') + (s.Highlighted ? ' hl-on' : '') + '" data-student="' + s.ID + '" data-search="' + esc(searchBlob) + '">' +
       '<div>' + esc(s.Name) + (s.RollNo ? ' <span class="muted">(' + esc(s.RollNo) + ')</span>' : '') +
         (s.Discontinued ? '<div class="tag-note">Discontinued' + (s.DiscontinuedAt ? ' on ' + fmtDate(s.DiscontinuedAt) : '') + '</div>'
           : s.BatchID !== ctx.batchId ? '<div class="tag-note">Now in ' + esc(batchNameAny(s.BatchID)) + '</div>' : '') +
-        (ctx.notes[s.ID] ? '<div class="muted" style="font-size:12px">' + esc(ctx.notes[s.ID]) + '</div>' : '') + '</div>' +
+        (ctx.notes[s.ID] ? '<div class="muted" style="font-size:12px">' + esc(ctx.notes[s.ID]) + '</div>' : '') + highlightBlock_(s) + '</div>' +
       '<div class="status-toggle">' +
         ['Present', 'Absent', 'Late'].map(function (st) {
           return '<button type="button" class="status-btn' + (status === st ? ' selected ' + st.toLowerCase() : '') +
@@ -956,6 +957,7 @@ function renderCalling() {
     '</div>' +
     '<div id="callingArea"></div>';
   loadAbsentees();
+  syncHighlights();
 }
 
 function loadAbsentees(btn) {
@@ -993,10 +995,11 @@ function renderAbsenteeList(res, batchId, date) {
     '<div class="card"><h3 style="margin-top:0">' + absentees.length + ' absentee(s) — ' + fmtDate(date) + '</h3></div>' +
     absentees.map(function (a) {
       const uid = 'call_' + a.studentId;
-      return '<div class="card' + (a.color ? ' row-' + esc(a.color) : '') + '" data-student="' + a.studentId + '">' +
+      const hlStudent = studentById_(a.studentId);
+      return '<div class="card' + (a.color ? ' row-' + esc(a.color) : '') + (hlStudent && hlStudent.Highlighted ? ' hl-on' : '') + '" data-student="' + a.studentId + '">' +
         '<div class="flex-between" style="margin-bottom:10px">' +
           '<div><strong>' + esc(a.name) + '</strong>' + (a.rollNo ? ' <span class="muted">(' + esc(a.rollNo) + ')</span>' : '') +
-            '<div class="muted" style="font-size:12.5px">Absent: ' + esc(a.subjects.join(', ')) + '</div></div>' +
+            '<div class="muted" style="font-size:12.5px">Absent: ' + esc(a.subjects.join(', ')) + '</div>' + highlightBlock_(hlStudent) + '</div>' +
           '<div class="call-numbers">' +
             (a.contacts && a.contacts.length
               ? '<div class="muted" style="font-size:11.5px;margin-bottom:2px">Call in this order</div>' + a.contacts.map(function (c, i) {
@@ -1213,6 +1216,7 @@ function renderBatches() {
       (state.batches.length ? renderTable(['Name', 'Description', 'Students', ''], state.batches.map(function (b) {
         return [esc(b.Name), esc(b.Description || ''), countFor(b.ID),
           '<a class="link" onclick=\'openBatchModal(' + JSON.stringify(b.ID) + ')\'>Edit</a> &nbsp; ' +
+          (hasPerm('student_edit') ? '<a class="link" onclick="openMergeModal(\'' + b.ID + '\')">Merge into…</a> &nbsp; ' : '') +
           '<a class="link" style="color:#d97706" onclick="closeBatchConfirm(this,\'' + b.ID + '\')">Close</a> &nbsp; ' +
           '<a class="link" style="color:#dc2626" onclick="deleteBatchConfirm(this,\'' + b.ID + '\')">Delete</a>'];
       })) : '<div class="empty-state">No open batches.</div>') +
@@ -1238,6 +1242,26 @@ function openBatchModal(id) {
       const call = batch ? gs('updateBatch', state.user.role, Object.assign({ id: batch.ID }, data)) : gs('createBatch', state.user.role, data);
       return call.then(function () { closeModal(); return refreshData(); }).then(function () { renderBatches(); toast('Saved', 'success'); });
     });
+}
+function openMergeModal(fromId) {
+  const from = state.batches.find(function (b) { return b.ID === fromId; });
+  const targets = state.batches.filter(function (b) { return b.ID !== fromId; });
+  if (!from || !targets.length) { toast('There is no other running batch to merge into', 'error'); return; }
+  const count = state.students.filter(function (s) { return s.BatchID === fromId; }).length;
+  showModal('mergeModal', 'Merge batch',
+    '<p style="margin-top:0">All <strong>' + count + '</strong> running students of <strong>' + esc(from.Name) + '</strong> will move into the batch you pick. ' +
+    'Discontinued students stay as they are. Everything already marked stays in ' + esc(from.Name) + ', and each student\'s Report Card shows old + new together.</p>' +
+    '<div class="field"><label>Merge into</label><select id="mergeTo">' + targets.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') + '</select></div>' +
+    '<div class="field"><label>Merged on (first day in the new batch)</label><input type="date" id="mergeDate" value="' + todayStr() + '"></div>' +
+    '<label class="check-row"><input type="checkbox" id="mergeClose" checked> Close ' + esc(from.Name) + ' after merging</label>',
+    function () {
+      const to = document.getElementById('mergeTo').value, date = document.getElementById('mergeDate').value, close = document.getElementById('mergeClose').checked;
+      if (!date) { toast('Pick the date', 'error'); return; }
+      if (!confirm('Move ' + count + ' students from ' + from.Name + ' into ' + batchNameAny(to) + ' from ' + fmtDate(date) + (close ? ' and close ' + from.Name : '') + '?')) return;
+      return gs('mergeBatchInto', state.user.role, fromId, to, date, close)
+        .then(function (res) { closeModal(); return refreshData().then(function () { clearAttendanceCaches(); renderBatches(); toast(res.moved + ' students moved' + (close ? ', batch closed' : ''), 'success'); }); })
+        .catch(function (e) { toast(e.message || String(e), 'error'); });
+    }, 'Merge');
 }
 function closeBatchConfirm(el, id) {
   if (!confirm('Close this batch?\n\nIt will disappear from Mark Attendance and Absentees Calling. Students and all attendance history are kept, and you can restore it any time.')) return;
@@ -1298,33 +1322,54 @@ function deleteSubjectConfirm(el, id) {
 
 /* ================= STUDENTS ================= */
 
+let studentsFilter = { batch: '', q: '' };
+
+/** The students this login may see on the Students page (non-admins: only their own batches). */
+function studentsBase_() {
+  if (isAdmin()) return state.students;
+  return state.students.filter(function (s) { return state.user.assignedBatchIds.indexOf(s.BatchID) !== -1; });
+}
+
 function renderStudents() {
   const content = document.getElementById('content');
+  const base = studentsBase_();
+  const counts = {};
+  base.forEach(function (s) { counts[s.BatchID || ''] = (counts[s.BatchID || ''] || 0) + 1; });
+  const batchOptions = filterBatches().map(function (b) {
+    return '<option value="' + b.ID + '"' + (studentsFilter.batch === b.ID ? ' selected' : '') + '>' + esc(b.Name) + (b.Closed ? ' (Closed)' : '') + ' (' + (counts[b.ID] || 0) + ')</option>';
+  }).join('');
   content.innerHTML =
     '<div class="card">' +
       '<div class="card-header"><h3>Students</h3><div>' +
         (hasPerm('bulk_import') ? '<button class="btn btn-secondary btn-sm" onclick="openBulkImport()">Bulk import</button> ' : '') +
         (hasPerm('student_add') ? '<button class="btn btn-primary btn-sm" onclick="openStudentModal()">+ Add student</button>' : '') + '</div></div>' +
-      '<div class="field" style="max-width:320px"><input type="text" id="studentSearch" placeholder="Search by name, roll no, or phone…" oninput="renderStudentsTable()"></div>' +
+      '<div class="filters">' +
+        '<div class="field"><label>Batch</label><select id="studentBatchFilter" onchange="renderStudentsTable()"><option value="">All batches (' + base.length + ')</option>' + batchOptions + '</select></div>' +
+        '<div class="field"><label>Search</label><input type="text" id="studentSearch" placeholder="Name, roll no, or phone…" value="' + esc(studentsFilter.q) + '" oninput="renderStudentsTable()"></div>' +
+      '</div>' +
       '<div id="studentsTableArea"></div>' +
     '</div>';
   renderStudentsTable();
 }
 function renderStudentsTable() {
-  const q = (document.getElementById('studentSearch').value || '').trim().toLowerCase();
-  const filtered = !q ? state.students : state.students.filter(function (s) {
+  studentsFilter.q = (document.getElementById('studentSearch').value || '').trim();
+  studentsFilter.batch = document.getElementById('studentBatchFilter').value;
+  const q = studentsFilter.q.toLowerCase();
+  let filtered = studentsBase_();
+  if (studentsFilter.batch) filtered = filtered.filter(function (s) { return s.BatchID === studentsFilter.batch; });
+  if (q) filtered = filtered.filter(function (s) {
     return String(s.Name || '').toLowerCase().indexOf(q) !== -1 ||
       String(s.RollNo || '').toLowerCase().indexOf(q) !== -1 ||
       contactNums_(s).toLowerCase().indexOf(q) !== -1;
   });
   document.getElementById('studentsTableArea').innerHTML = filtered.length
-    ? renderTable(['Name', 'Roll No', 'Batch', 'Contact numbers (call in this order)', ''], filtered.map(function (s) {
-        return [esc(s.Name), esc(s.RollNo || ''), esc(batchNameAny(s.BatchID)), contactsHtml(s.Contacts),
+    ? '<div class="muted" style="margin-bottom:8px">' + filtered.length + ' student(s)</div>' + renderTable(['Name', 'Roll No', 'Batch', 'Contact numbers (call in this order)', ''], filtered.map(function (s) {
+        return [esc(s.Name) + (s.Highlighted ? ' <span class="hl-flag" title="' + esc(s.HighlightRemark) + '">⚑</span>' : ''), esc(s.RollNo || ''), esc(batchNameAny(s.BatchID)), contactsHtml(s.Contacts),
           (hasPerm('student_edit') ? '<a class="link" onclick=\'openStudentModal(' + JSON.stringify(s.ID) + ')\'>Edit</a> &nbsp; <a class="link" onclick="openShiftModal(\'' + s.ID + '\')">Shift batch</a> &nbsp; ' : '') +
           (hasPerm('student_discontinue') ? '<a class="link" style="color:#d97706" onclick=\'openDiscontinueModal(' + JSON.stringify(s.ID) + ')\'>Discontinue</a> &nbsp; ' : '') +
           (hasPerm('student_delete') ? '<a class="link" style="color:#dc2626" onclick="deleteStudentConfirm(this,\'' + s.ID + '\')">Delete</a>' : '')];
       }))
-    : '<div class="empty-state">No students match "' + esc(q) + '".</div>';
+    : '<div class="empty-state">No students match' + (studentsFilter.batch ? ' in this batch' : '') + (q ? ' "' + esc(studentsFilter.q) + '"' : '') + '.</div>';
 }
 function openStudentModal(id) {
   const student = id ? state.students.find(function (s) { return s.ID === id; }) : null;
@@ -1336,10 +1381,10 @@ function openStudentModal(id) {
       '<div class="field"><label>Roll No</label><input id="stRoll" value="' + esc(student ? student.RollNo : '') + '"></div>' +
     '</div>' +
     (student
-      ? '<div class="field"><label>Batch</label><div>' + esc(batchNameAny(student.BatchID)) + ' &nbsp; <a class="link" onclick="closeModal();openShiftModal(\'' + student.ID + '\')">Shift to another batch…</a></div>' +
+      ? '<div class="field"><label>Batch</label><div>' + esc(batchNameAny(student.BatchID)) + ' &nbsp; <a class="link" onclick="closeModal();openShiftModal(\'' + student.ID + '\')">Shift to another batch…</a> &nbsp; <a class="link" onclick="closeModal();openBatchHistoryModal(\'' + student.ID + '\')">Batch history…</a></div>' +
         '<div class="muted" style="font-size:12px;margin-top:4px">Shifting keeps the same student profile and all old attendance.</div></div>'
       : '<div class="field"><label>Batch</label><select id="stBatch">' +
-        batchOpts.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') +
+        batchOpts.map(function (b) { return '<option value="' + b.ID + '"' + (studentsFilter.batch === b.ID ? ' selected' : '') + '>' + esc(b.Name) + '</option>'; }).join('') +
       '</select></div>') +
     '<div class="field"><label>Mobile numbers — in the order they should be called</label>' +
       '<div id="contactList"></div>' +
@@ -1756,6 +1801,135 @@ function deleteUserConfirm(el, id) {
   });
 }
 
+
+/* ================= HIGHLIGHT (a flag + remark everyone can see) ================= */
+
+function studentById_(id) { return state.students.concat(state.discontinued || []).find(function (s) { return s.ID === id; }); }
+function fmtShortDate_(iso) {
+  if (!iso) return '';
+  return new Date(iso).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+function highlightBlock_(s) {
+  if (!s) return '';
+  const on = !!s.Highlighted;
+  return '<div class="hl-block" data-hl="' + s.ID + '">' +
+    (on ? '<div class="hl-note">⚑ <b>' + esc(s.HighlightRemark || 'Highlighted') + '</b><span> — by ' + esc(s.HighlightedBy || '?') + (s.HighlightedAt ? ', ' + esc(fmtShortDate_(s.HighlightedAt)) : '') + '</span></div>' : '') +
+    '<button type="button" class="hl-btn' + (on ? ' on' : '') + '" onclick="openHighlightModal(\'' + s.ID + '\')">⚑ ' + (on ? 'Edit highlight' : 'Highlight') + '</button></div>';
+}
+/** Redraws every highlight block for this student on screen (without reloading the sheet, so unsaved marks stay). */
+function applyHighlightUi_(id) {
+  const s = studentById_(id);
+  if (!s) return;
+  document.querySelectorAll('[data-hl="' + id + '"]').forEach(function (el) {
+    const box = el.closest('.attendance-row') || el.closest('[data-student]');
+    const tmp = document.createElement('div');
+    tmp.innerHTML = highlightBlock_(s);
+    el.replaceWith(tmp.firstChild);
+    if (box) box.classList.toggle('hl-on', !!s.Highlighted);
+  });
+}
+function setHighlightLocal_(id, h) {
+  const s = studentById_(id);
+  if (!s) return;
+  s.Highlighted = !!h.highlighted; s.HighlightRemark = h.remark || ''; s.HighlightedBy = h.by || ''; s.HighlightedAt = h.at || '';
+}
+/** Picks up highlights made by other logins since this screen was opened. */
+function syncHighlights() {
+  gs('getHighlights').then(function (list) {
+    const map = {};
+    list.forEach(function (h) { map[h.ID] = h; });
+    state.students.concat(state.discontinued || []).forEach(function (s) {
+      const h = map[s.ID];
+      setHighlightLocal_(s.ID, h ? { highlighted: true, remark: h.remark, by: h.by, at: h.at } : { highlighted: false });
+    });
+    const ids = {};
+    document.querySelectorAll('[data-hl]').forEach(function (el) { ids[el.getAttribute('data-hl')] = true; });
+    Object.keys(ids).forEach(applyHighlightUi_);
+  }).catch(function () { /* older database without the highlight columns yet */ });
+}
+function openHighlightModal(id) {
+  const s = studentById_(id);
+  if (!s) return;
+  const on = !!s.Highlighted;
+  showModal('hlModal', (on ? 'Edit highlight — ' : 'Highlight — ') + s.Name,
+    (on ? '<p class="muted" style="margin-top:0">Highlighted by <b>' + esc(s.HighlightedBy || '?') + '</b>' + (s.HighlightedAt ? ' on ' + esc(fmtShortDate_(s.HighlightedAt)) : '') + '. Everyone who opens this student sees it.</p>'
+          : '<p class="muted" style="margin-top:0">Everyone who opens this student will see this remark, along with your name.</p>') +
+    '<div class="field"><label>Why are you highlighting this student?</label><textarea id="hlRemark" rows="3" placeholder="e.g. Fee pending — ask before allowing in class">' + esc(s.HighlightRemark || '') + '</textarea></div>' +
+    (on ? '<a class="link" style="color:#dc2626" onclick="removeHighlight(\'' + id + '\')">Remove highlight</a>' : ''),
+    function () {
+      const remark = document.getElementById('hlRemark').value.trim();
+      if (!remark) { toast('Write the reason for the highlight', 'error'); return; }
+      return gs('setStudentHighlight', state.user.role, id, true, remark).then(function (res) {
+        setHighlightLocal_(id, res); closeModal(); applyHighlightUi_(id); toast('Highlighted', 'success');
+      }).catch(function (e) { toast(e.message || String(e), 'error'); });
+    }, on ? 'Update' : 'Highlight');
+}
+function removeHighlight(id) {
+  gs('setStudentHighlight', state.user.role, id, false, '').then(function (res) {
+    setHighlightLocal_(id, res); closeModal(); applyHighlightUi_(id); toast('Highlight removed', 'success');
+  }).catch(function (e) { toast(e.message || String(e), 'error'); });
+}
+
+/* ================= BATCH HISTORY (set previous batch) ================= */
+
+function addDaysIso_(iso, n) {
+  const d = new Date(iso + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function openBatchHistoryModal(id) {
+  const s = state.students.find(function (x) { return x.ID === id; });
+  if (!s) return;
+  gs('getStudentBatchTrail', id).then(function (trail) {
+    const cur = trail.find(function (t) { return t.batchId === s.BatchID; });
+    const others = trail.filter(function (t) { return t.batchId !== s.BatchID; });
+    const guess = others.length ? others[others.length - 1] : null;
+    const suggestDate = cur ? cur.from : (guess ? addDaysIso_(guess.to, 1) : todayStr());
+    const history = s.BatchHistory || [];
+    const allBatches = state.batches.concat(state.closedBatches || []).filter(function (b) { return b.ID !== s.BatchID; });
+    const range = function (a, b) { return (a ? fmtDate(a) : 'start') + ' – ' + (b ? fmtDate(b) : ''); };
+    showModal('bhModal', 'Batch history — ' + s.Name,
+      '<p style="margin-top:0">Now in <strong>' + esc(batchNameAny(s.BatchID)) + '</strong>' + (s.BatchSince ? ' since ' + fmtDate(s.BatchSince) : ' <span class="muted">(joining date not recorded)</span>') + '.</p>' +
+      '<div class="field"><label>Attendance found in these batches</label>' +
+        (trail.length ? trail.map(function (t) {
+          return '<div class="contact-line" style="white-space:normal">' + esc(batchNameAny(t.batchId)) + ' — ' + range(t.from, t.to) + ' (' + t.count + ' records)' + (t.batchId === s.BatchID ? ' <span class="muted">· current</span>' : '') + '</div>';
+        }).join('') : '<span class="muted">No attendance marked yet.</span>') + '</div>' +
+      '<div class="field"><label>Saved previous batches</label>' +
+        (history.length ? history.map(function (h, i) {
+          return '<div class="contact-line" style="white-space:normal">' + esc(batchNameAny(h.batchId)) + ' — ' + range(h.from, h.to) + ' &nbsp; <a class="link" style="color:#dc2626" onclick="removeHistoryEntry(\'' + id + '\',' + i + ')">Remove</a></div>';
+        }).join('') : '<span class="muted">None saved yet.</span>') + '</div>' +
+      (allBatches.length
+        ? '<hr style="border:none;border-top:1px solid var(--border);margin:14px 0">' +
+          '<div class="field"><label>Previous batch</label><select id="bhPrev">' + allBatches.map(function (b) {
+            return '<option value="' + b.ID + '"' + (guess && guess.batchId === b.ID ? ' selected' : '') + '>' + esc(b.Name) + (b.Closed ? ' (Closed)' : '') + '</option>';
+          }).join('') + '</select></div>' +
+          '<div class="field"><label>Moved out of the previous batch on (first day in ' + esc(batchNameAny(s.BatchID)) + ')</label><input type="date" id="bhDate" value="' + suggestDate + '"></div>' +
+          '<div class="muted" style="font-size:12px">' + (guess ? 'Previous batch and date are suggested from the attendance already marked — change them if they are wrong. ' : '') +
+          'Before this date the student shows on the previous batch\'s sheet; from this date on ' + esc(batchNameAny(s.BatchID)) + '\'s.</div>'
+        : ''),
+      function () {
+        if (!allBatches.length) { closeModal(); return; }
+        const prev = document.getElementById('bhPrev').value, date = document.getElementById('bhDate').value;
+        if (!prev || !date) { toast('Pick the previous batch and the date', 'error'); return; }
+        const t = trail.find(function (x) { return x.batchId === prev; });
+        const kept = history.filter(function (h) { return h.batchId !== prev; });
+        const latest = kept.every(function (h) { return h.to <= date; });
+        return gs('saveBatchHistory', state.user.role, id, kept.concat([{ batchId: prev, from: t ? t.from : null, to: date }]), latest ? date : (s.BatchSince || null))
+          .then(function () { closeModal(); return refreshData(); })
+          .then(function () { clearAttendanceCaches(); renderStudents(); toast('Batch history saved', 'success'); })
+          .catch(function (e) { toast(e.message || String(e), 'error'); });
+      }, 'Save');
+  }).catch(function (e) { toast(e.message || String(e), 'error'); });
+}
+function removeHistoryEntry(id, index) {
+  const s = state.students.find(function (x) { return x.ID === id; });
+  if (!s) return;
+  const history = (s.BatchHistory || []).filter(function (h, i) { return i !== index; });
+  gs('saveBatchHistory', state.user.role, id, history, history.length ? s.BatchSince : null)
+    .then(function () { closeModal(); return refreshData(); })
+    .then(function () { clearAttendanceCaches(); renderStudents(); toast('Removed', 'success'); })
+    .catch(function (e) { toast(e.message || String(e), 'error'); });
+}
 
 /* ================= ACTIVITY LOG (admin) ================= */
 

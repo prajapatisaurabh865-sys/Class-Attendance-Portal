@@ -160,6 +160,7 @@ function rowToStudent_(r) {
   return {
     ID: r.id, Name: r.name, RollNo: r.roll_no || '', BatchID: r.batch_id,
     Phone: r.phone || '', Email: r.email || '', ParentPhone: r.parent_phone || '', Contacts: normalizeContacts_(r),
+    Highlighted: !!r.highlighted, HighlightRemark: r.highlight_remark || '', HighlightedBy: r.highlighted_by || '', HighlightedAt: r.highlighted_at || '',
     BatchSince: r.batch_since || '', BatchHistory: Array.isArray(r.batch_history) ? r.batch_history : [],
     AdmissionDate: r.admission_date || '', Active: r.active,
     Discontinued: !!r.discontinued, DiscontinuedAt: r.discontinued_at || '', DiscontinueReason: r.discontinue_reason || ''
@@ -401,6 +402,65 @@ const API = {
     const history = Array.isArray(row.batch_history) ? row.batch_history.slice() : [];
     if (row.batch_id) history.push({ batchId: row.batch_id, from: row.batch_since || null, to: date });
     const { error } = await sb.from('students').update({ batch_id: newBatchId, batch_since: date, batch_history: history }).eq('id', studentId);
+    throwIfError_(error);
+    return { success: true };
+  },
+  /** Moves every running student of one batch into another from a date (history kept), optionally closing the old batch. */
+  mergeBatchInto: async function (role, fromId, toId, effectiveDate, closeAfter) {
+    requirePerm_('batches');
+    requirePerm_('student_edit');
+    if (!fromId || !toId || fromId === toId) throw new Error('Pick a different batch to merge into.');
+    const date = effectiveDate || todayStr();
+    const rows = await fetchAll_(function () {
+      return sb.from('students').select('id, batch_since, batch_history').eq('batch_id', fromId).eq('active', true).eq('discontinued', false).order('id');
+    });
+    for (let i = 0; i < rows.length; i += 20) {
+      await Promise.all(rows.slice(i, i + 20).map(async function (r) {
+        const history = Array.isArray(r.batch_history) ? r.batch_history.slice() : [];
+        history.push({ batchId: fromId, from: r.batch_since || null, to: date });
+        const { error } = await sb.from('students').update({ batch_id: toId, batch_since: date, batch_history: history }).eq('id', r.id);
+        throwIfError_(error);
+      }));
+    }
+    if (closeAfter) {
+      const { error } = await sb.from('batches').update({ closed: true, closed_at: todayStr() }).eq('id', fromId);
+      throwIfError_(error);
+    }
+    return { success: true, moved: rows.length };
+  },
+  /** Flag a student with a remark everyone can see (who flagged it is stored too). Anyone who can mark attendance or call may do this. */
+  setStudentHighlight: async function (role, studentId, on, remark) {
+    if (!can_('mark') && !can_('calling')) throw new Error('You do not have permission to do this.');
+    const u = currentUser_();
+    const patch = on
+      ? { highlighted: true, highlight_remark: remark || '', highlighted_by: u ? u.name : '', highlighted_at: new Date().toISOString() }
+      : { highlighted: false, highlight_remark: '', highlighted_by: '', highlighted_at: null };
+    const { error } = await sb.from('students').update(patch).eq('id', studentId);
+    throwIfError_(error);
+    return { highlighted: !!on, remark: patch.highlight_remark, by: patch.highlighted_by, at: patch.highlighted_at || '' };
+  },
+  /** Fresh list of currently highlighted students, so highlights made by other logins show up. */
+  getHighlights: async function () {
+    const data = await fetchAll_(function () { return sb.from('students').select('id, highlight_remark, highlighted_by, highlighted_at').eq('highlighted', true).order('id'); });
+    return data.map(function (r) { return { ID: r.id, remark: r.highlight_remark || '', by: r.highlighted_by || '', at: r.highlighted_at || '' }; });
+  },
+  /** Which batches this student actually has attendance in (first / last date and count) — used to rebuild batch history. */
+  getStudentBatchTrail: async function (studentId) {
+    const data = await fetchAll_(function () { return sb.from('attendance').select('batch_id, date').eq('student_id', studentId).order('id'); });
+    const m = {};
+    data.forEach(function (r) {
+      const x = m[r.batch_id] || (m[r.batch_id] = { batchId: r.batch_id, from: r.date, to: r.date, count: 0 });
+      if (r.date < x.from) x.from = r.date;
+      if (r.date > x.to) x.to = r.date;
+      x.count++;
+    });
+    return Object.keys(m).map(function (k) { return m[k]; }).sort(function (a, b) { return a.from < b.from ? -1 : a.from > b.from ? 1 : 0; });
+  },
+  saveBatchHistory: async function (role, studentId, history, batchSince) {
+    requirePerm_('student_edit');
+    const clean = (history || []).filter(function (h) { return h && h.batchId && h.to; })
+      .map(function (h) { return { batchId: h.batchId, from: h.from || null, to: h.to }; });
+    const { error } = await sb.from('students').update({ batch_history: clean, batch_since: batchSince || null }).eq('id', studentId);
     throwIfError_(error);
     return { success: true };
   },
@@ -953,6 +1013,9 @@ const AUDIT_NAMES_ = {
     deleteSubject: function (a) { return { action: 'Subject deleted', details: N.subject(a[1]) }; },
     createStudent: function (a) { return { action: 'Student added', details: a[1].name + (a[1].rollNo ? ' (' + a[1].rollNo + ')' : '') + ' · ' + N.batch(a[1].batchId) }; },
     updateStudent: function (a) { return { action: 'Student edited', details: N.student(a[1].id) + (a[1].name ? ' → ' + a[1].name : '') }; },
+    mergeBatchInto: function (a, res) { return { action: 'Batch merged', details: N.batch(a[1]) + ' → ' + N.batch(a[2]) + ' (' + (res && res.moved) + ' students, from ' + (a[3] || 'today') + (a[4] ? ', old batch closed' : '') + ')' }; },
+    setStudentHighlight: function (a) { return { action: a[2] ? 'Student highlighted' : 'Highlight removed', details: N.student(a[1]) + (a[3] ? ' — ' + a[3] : '') }; },
+    saveBatchHistory: function (a) { return { action: 'Batch history edited', details: N.student(a[1]) + ' — ' + (a[2] || []).map(function (h) { return N.batch(h.batchId) + ' until ' + h.to; }).join(', ') }; },
     shiftStudentBatch: function (a) { return { action: 'Student shifted batch', details: N.student(a[1]) + ' → ' + N.batch(a[2]) + ' (from ' + (a[3] || 'today') + ')' }; },
     deleteStudent: function (a) { return { action: 'Student deleted', details: N.student(a[1]) }; },
     discontinueStudent: function (a) { return { action: 'Student discontinued', details: N.student(a[1]) + (a[2] ? ' — ' + a[2] : '') }; },
