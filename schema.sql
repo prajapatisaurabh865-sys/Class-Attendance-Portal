@@ -1,5 +1,5 @@
 -- ==================================================================
---  ATTENDANCE MANAGER — SUPABASE SCHEMA  (v4)
+--  ATTENDANCE MANAGER — SUPABASE SCHEMA  (v5)
 -- ==================================================================
 -- Run this in Supabase (safe to run again on an existing database —
 -- it only adds what is missing and keeps all your data): Dashboard → SQL Editor → New query →
@@ -162,6 +162,10 @@ drop policy if exists "activity add" on activity_log;
 drop policy if exists "activity read" on activity_log;
 create policy "activity add" on activity_log for insert with check (true);
 create policy "activity read" on activity_log for select using (true);
+
+-- v5: moving a student between batches keeps ONE profile and remembers where they used to be
+alter table students add column if not exists batch_since date;
+alter table students add column if not exists batch_history jsonb not null default '[]'::jsonb;
 
 -- ---------------- INDEXES ----------------
 

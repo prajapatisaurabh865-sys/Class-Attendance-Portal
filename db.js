@@ -160,6 +160,7 @@ function rowToStudent_(r) {
   return {
     ID: r.id, Name: r.name, RollNo: r.roll_no || '', BatchID: r.batch_id,
     Phone: r.phone || '', Email: r.email || '', ParentPhone: r.parent_phone || '', Contacts: normalizeContacts_(r),
+    BatchSince: r.batch_since || '', BatchHistory: Array.isArray(r.batch_history) ? r.batch_history : [],
     AdmissionDate: r.admission_date || '', Active: r.active,
     Discontinued: !!r.discontinued, DiscontinuedAt: r.discontinued_at || '', DiscontinueReason: r.discontinue_reason || ''
   };
@@ -389,6 +390,20 @@ const API = {
     throwIfError_(error);
     return { success: true };
   },
+  /** Moves a student to another batch from a given date. Their old attendance stays in the old batch. */
+  shiftStudentBatch: async function (role, studentId, newBatchId, effectiveDate) {
+    requirePerm_('student_edit');
+    if (!newBatchId) throw new Error('Pick the new batch.');
+    const date = effectiveDate || todayStr();
+    const { data: row, error: gErr } = await sb.from('students').select('batch_id, batch_since, batch_history').eq('id', studentId).single();
+    throwIfError_(gErr);
+    if (row.batch_id === newBatchId) throw new Error('The student is already in that batch.');
+    const history = Array.isArray(row.batch_history) ? row.batch_history.slice() : [];
+    if (row.batch_id) history.push({ batchId: row.batch_id, from: row.batch_since || null, to: date });
+    const { error } = await sb.from('students').update({ batch_id: newBatchId, batch_since: date, batch_history: history }).eq('id', studentId);
+    throwIfError_(error);
+    return { success: true };
+  },
   deleteStudent: async function (role, id) {
     requirePerm_('student_delete');
     const { error } = await sb.from('students').update({ active: false }).eq('id', id);
@@ -467,8 +482,13 @@ const API = {
     const priorByStudent = {};
     (existing || []).forEach(function (r) { priorByStudent[r.student_id] = { remark: r.remark || '', reason: r.reason || '', color: r.color || '' }; });
 
-    if (existing && existing.length) {
-      const { error: delErr } = await sb.from('attendance').delete().eq('date', date).eq('batch_id', batchId).eq('subject_id', subjectId);
+    // Replace ONLY the marks of the students being saved. Anyone else with a mark in this class
+    // (a student who has since moved to another batch or been discontinued) is left untouched.
+    const savingIds = {};
+    records.forEach(function (rec) { savingIds[rec.studentId] = true; });
+    const toDelete = (existing || []).filter(function (r) { return savingIds[r.student_id]; }).map(function (r) { return r.id; });
+    for (let i = 0; i < toDelete.length; i += 100) {
+      const { error: delErr } = await sb.from('attendance').delete().in('id', toDelete.slice(i, i + 100));
       throwIfError_(delErr);
     }
 
@@ -933,6 +953,7 @@ const AUDIT_NAMES_ = {
     deleteSubject: function (a) { return { action: 'Subject deleted', details: N.subject(a[1]) }; },
     createStudent: function (a) { return { action: 'Student added', details: a[1].name + (a[1].rollNo ? ' (' + a[1].rollNo + ')' : '') + ' · ' + N.batch(a[1].batchId) }; },
     updateStudent: function (a) { return { action: 'Student edited', details: N.student(a[1].id) + (a[1].name ? ' → ' + a[1].name : '') }; },
+    shiftStudentBatch: function (a) { return { action: 'Student shifted batch', details: N.student(a[1]) + ' → ' + N.batch(a[2]) + ' (from ' + (a[3] || 'today') + ')' }; },
     deleteStudent: function (a) { return { action: 'Student deleted', details: N.student(a[1]) }; },
     discontinueStudent: function (a) { return { action: 'Student discontinued', details: N.student(a[1]) + (a[2] ? ' — ' + a[2] : '') }; },
     restoreStudent: function (a) { return { action: 'Student restored', details: N.student(a[1]) }; },

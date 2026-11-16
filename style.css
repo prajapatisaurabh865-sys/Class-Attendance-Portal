@@ -311,3 +311,5 @@
     .field-wide { min-width: 0; flex-basis: 100%; }
   }
   .check-row.perm-child { margin-left: 22px; }
+
+  .tag-note { display: inline-block; font-size: 11.5px; background: #fef3c7; color: #92400e; border-radius: 4px; padding: 1px 7px; margin-top: 2px; }

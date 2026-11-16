@@ -621,10 +621,8 @@ function loadSession(btn) {
   if (!subjectId || !date) { if (btn) toast('Pick a subject and date first', 'error'); return; }
 
   const area = document.getElementById('sessionArea');
-  const roster = state.students.filter(function (s) { return s.BatchID === batchId; });
   const token = ++sessionToken;
   sessionCtx = null;
-  if (!roster.length) { area.innerHTML = '<div class="empty-state">No students in this batch yet.</div>'; return; }
 
   const isAll = subjectId === '__ALL__';
   area.innerHTML = '<div class="empty-state">Loading attendance…</div>';
@@ -634,6 +632,8 @@ function loadSession(btn) {
   ]);
   const task = load.then(function (res) {
     if (token !== sessionToken) return; // a newer selection took over
+    const roster = rosterFor_(batchId, date, res[0].map(function (r) { return r.StudentID; }));
+    if (!roster.length) { area.innerHTML = '<div class="empty-state">No students in this batch' + (date ? ' on ' + fmtDate(date) : '') + '.</div>'; return; }
     sessionCtx = buildSessionContext_(batchId, subjectId, date, isAll, res[0], res[1]);
     renderMarkRoster(sessionCtx, roster);
   }).catch(function (e) {
@@ -642,12 +642,27 @@ function loadSession(btn) {
   if (btn) runWithLoading(btn, 'Loading…', function () { return task; });
 }
 
+/** Who belongs on this batch's sheet for this date: today's students, plus anyone who was here on that date
+ *  (moved to another batch later / discontinued later) or who already has a mark saved here. */
+function rosterFor_(batchId, date, markedIds) {
+  const marked = {};
+  (markedIds || []).forEach(function (id) { marked[id] = true; });
+  return state.students.concat(state.discontinued || []).filter(function (s) {
+    const here = s.BatchID === batchId && !s.Discontinued && (!s.BatchSince || date >= s.BatchSince);
+    const wasHere = (s.BatchHistory || []).some(function (h) { return h.batchId === batchId && (!h.from || date >= h.from) && date < h.to; });
+    const leftLater = s.Discontinued && s.BatchID === batchId && s.DiscontinuedAt && date < s.DiscontinuedAt && (!s.BatchSince || date >= s.BatchSince);
+    return here || wasHere || leftLater || marked[s.ID];
+  }).sort(function (a, b) { return String(a.Name).toLowerCase() < String(b.Name).toLowerCase() ? -1 : 1; });
+}
+
 function renderMarkRoster(ctx, roster) {
   const rows = roster.map(function (s) {
     const status = ctx.orig[s.ID] || ''; // nothing is assumed — unmarked stays unmarked
     const searchBlob = (s.Name + ' ' + (s.RollNo || '') + ' ' + (s.Phone || '')).toLowerCase();
     return '<div class="attendance-row' + (status ? '' : ' unmarked') + '" data-student="' + s.ID + '" data-search="' + esc(searchBlob) + '">' +
       '<div>' + esc(s.Name) + (s.RollNo ? ' <span class="muted">(' + esc(s.RollNo) + ')</span>' : '') +
+        (s.Discontinued ? '<div class="tag-note">Discontinued' + (s.DiscontinuedAt ? ' on ' + fmtDate(s.DiscontinuedAt) : '') + '</div>'
+          : s.BatchID !== ctx.batchId ? '<div class="tag-note">Now in ' + esc(batchNameAny(s.BatchID)) + '</div>' : '') +
         (ctx.notes[s.ID] ? '<div class="muted" style="font-size:12px">' + esc(ctx.notes[s.ID]) + '</div>' : '') + '</div>' +
       '<div class="status-toggle">' +
         ['Present', 'Absent', 'Late'].map(function (st) {
@@ -1305,7 +1320,7 @@ function renderStudentsTable() {
   document.getElementById('studentsTableArea').innerHTML = filtered.length
     ? renderTable(['Name', 'Roll No', 'Batch', 'Contact numbers (call in this order)', ''], filtered.map(function (s) {
         return [esc(s.Name), esc(s.RollNo || ''), esc(batchNameAny(s.BatchID)), contactsHtml(s.Contacts),
-          (hasPerm('student_edit') ? '<a class="link" onclick=\'openStudentModal(' + JSON.stringify(s.ID) + ')\'>Edit</a> &nbsp; ' : '') +
+          (hasPerm('student_edit') ? '<a class="link" onclick=\'openStudentModal(' + JSON.stringify(s.ID) + ')\'>Edit</a> &nbsp; <a class="link" onclick="openShiftModal(\'' + s.ID + '\')">Shift batch</a> &nbsp; ' : '') +
           (hasPerm('student_discontinue') ? '<a class="link" style="color:#d97706" onclick=\'openDiscontinueModal(' + JSON.stringify(s.ID) + ')\'>Discontinue</a> &nbsp; ' : '') +
           (hasPerm('student_delete') ? '<a class="link" style="color:#dc2626" onclick="deleteStudentConfirm(this,\'' + s.ID + '\')">Delete</a>' : '')];
       }))
@@ -1320,9 +1335,12 @@ function openStudentModal(id) {
       '<div class="field"><label>Name</label><input id="stName" value="' + esc(student ? student.Name : '') + '"></div>' +
       '<div class="field"><label>Roll No</label><input id="stRoll" value="' + esc(student ? student.RollNo : '') + '"></div>' +
     '</div>' +
-    '<div class="field"><label>Batch</label><select id="stBatch">' +
-      batchOpts.map(function (b) { return '<option value="' + b.ID + '"' + (student && student.BatchID === b.ID ? ' selected' : '') + '>' + esc(b.Name) + (b.Closed ? ' (Closed)' : '') + '</option>'; }).join('') +
-    '</select></div>' +
+    (student
+      ? '<div class="field"><label>Batch</label><div>' + esc(batchNameAny(student.BatchID)) + ' &nbsp; <a class="link" onclick="closeModal();openShiftModal(\'' + student.ID + '\')">Shift to another batch…</a></div>' +
+        '<div class="muted" style="font-size:12px;margin-top:4px">Shifting keeps the same student profile and all old attendance.</div></div>'
+      : '<div class="field"><label>Batch</label><select id="stBatch">' +
+        batchOpts.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') +
+      '</select></div>') +
     '<div class="field"><label>Mobile numbers — in the order they should be called</label>' +
       '<div id="contactList"></div>' +
       '<button type="button" class="btn btn-secondary btn-sm" onclick="addContactRow()">+ Add another number</button>' +
@@ -1333,7 +1351,7 @@ function openStudentModal(id) {
       const data = {
         name: document.getElementById('stName').value.trim(),
         rollNo: document.getElementById('stRoll').value.trim(),
-        batchId: document.getElementById('stBatch').value,
+        batchId: student ? undefined : document.getElementById('stBatch').value,
         email: document.getElementById('stEmail').value.trim()
       };
       if (!data.name) { toast('Name is required', 'error'); return; }
@@ -1392,6 +1410,25 @@ function collectContacts() {
     out.push({ label: rows[i].querySelector('.c-label').value, number: num });
   }
   return out;
+}
+function openShiftModal(id) {
+  const s = state.students.find(function (x) { return x.ID === id; });
+  if (!s) return;
+  const options = state.batches.filter(function (b) { return b.ID !== s.BatchID; });
+  if (!options.length) { toast('There is no other running batch to shift to', 'error'); return; }
+  showModal('shiftModal', 'Shift to another batch',
+    '<p style="margin-top:0"><strong>' + esc(s.Name) + '</strong> is now in <strong>' + esc(batchNameAny(s.BatchID)) + '</strong>. After shifting, they stop appearing on the old batch\'s attendance sheet from the date below. ' +
+    'Everything already marked stays in the old batch, and the Report Card shows old + new together under this one profile.</p>' +
+    '<div class="field"><label>New batch</label><select id="shiftBatch">' + options.map(function (b) { return '<option value="' + b.ID + '">' + esc(b.Name) + '</option>'; }).join('') + '</select></div>' +
+    '<div class="field"><label>Shifted on (first day in the new batch)</label><input type="date" id="shiftDate" value="' + todayStr() + '"></div>',
+    function () {
+      const nb = document.getElementById('shiftBatch').value, date = document.getElementById('shiftDate').value;
+      if (!date) { toast('Pick the date', 'error'); return; }
+      return gs('shiftStudentBatch', state.user.role, id, nb, date)
+        .then(function () { closeModal(); return refreshData(); })
+        .then(function () { clearAttendanceCaches(); renderStudents(); toast('Student shifted', 'success'); })
+        .catch(function (e) { toast(e.message || String(e), 'error'); });
+    }, 'Shift');
 }
 function openDiscontinueModal(id) {
   const s = state.students.find(function (x) { return x.ID === id; });
